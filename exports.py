@@ -11,9 +11,17 @@ KINDS={'receipt':'Приёмка сырья','production':'Выпуск прод
 def document_table(doc):
     data=doc['data']; rows=[]
     if doc['kind'] in ('receipt','shipment','return'):
-        rows=[['Наименование','Количество','Ед.','Цена, ₽','Сумма, ₽']]
-        for x in data['lines']: rows.append([x['name'],x['qty'],x['unit'],x['price'],round(x['qty']*x['price'],2)])
-        rows.append(['Итого','','','',doc['total']])
+        if doc['kind']=='shipment':
+            rows=[['Наименование','Ед.','Количество','Цена до скидки, ₽','Скидка, %','Сумма, ₽']]
+            for x in data['lines']: rows.append([x['name'],x['unit'],x['qty'],x.get('gross_price',x['price']),data.get('discount_percent',0),x.get('line_total',round(x['qty']*x['price'],2))])
+        else:
+            rows=[['Наименование','Количество','Ед.','Цена, ₽','Сумма, ₽']]
+            for x in data['lines']: rows.append([x['name'],x['qty'],x['unit'],x['price'],x.get('line_total',round(x['qty']*x['price'],2))])
+        blanks=['']*(len(rows[0])-2)
+        if data.get('discount_percent'):
+            rows.append(['До скидки']+blanks+[data['subtotal']])
+            rows.append([f"Скидка {data['discount_percent']}%"]+blanks+[data['discount_amount']])
+        rows.append(['Итого']+blanks+[doc['total']])
     elif doc['kind']=='production':
         rows=[['Выпущено',data['name'],data['qty'],data['unit']],['Стоимость выпуска, ₽',round(doc['cost'],2)],['Сырьё / полуфабрикат','Количество','Ед.','Стоимость, ₽']]
         for x in data['inputs']: rows.append([x['name'],x['qty'],x['unit'],round(sum(l['qty']*l['unit_cost'] for l in x['lots']),2)])
@@ -27,8 +35,8 @@ def document_table(doc):
     else:
         rows=[['Операция','Сумма, ₽'],[data.get('client_name',data.get('category','')),doc['total']]]
     meta=([['Статус','ОТМЕНЁН']] if doc.get('reversed') else [])+[['Дата',doc['date']],['Ответственный',doc['responsible']]]
-    for key in ('supplier_name','client_name','due','order_id','override_reason'):
-        if data.get(key): meta.append([{'supplier_name':'Поставщик','client_name':'Клиент','due':'Оплатить до','order_id':'Заказ','override_reason':'Согласование лимита'}[key],data[key]])
+    for key in ('sender_name','sender_address','sender_phone','client_name','delivery_address','delivery_phone','delivery_contact','driver_name','vehicle','supplier_name','due','order_id','override_reason'):
+        if data.get(key) or (doc['kind']=='shipment' and key in ('sender_name','client_name','delivery_address','delivery_phone','delivery_contact')): meta.append([{'sender_name':'Кто отгружает','sender_address':'Адрес отправителя','sender_phone':'Телефон отправителя','delivery_address':'Адрес доставки','delivery_phone':'Телефон покупателя','delivery_contact':'Контактное лицо покупателя','driver_name':'Водитель','vehicle':'Автомобиль','supplier_name':'Поставщик','client_name':'Клиент','due':'Оплатить до','order_id':'Заказ','override_reason':'Согласование лимита'}[key],data.get(key) or '—'])
     if doc['note']: meta.append(['Примечание',doc['note']])
     return f'{KINDS[doc["kind"]]} № {doc["id"]}',meta+[[]]+rows
 
@@ -82,3 +90,25 @@ def export(title,rows,fmt):
         html='<!doctype html><html lang="ru"><meta charset="utf-8"><title>'+escape(title)+'</title><style>body{font:14px Arial;margin:32px;color:#162c28}table{border-collapse:collapse;width:100%}td{border:1px solid #ccd6d3;padding:9px}h1{font-size:24px}button{padding:10px;margin-bottom:20px}@media print{button{display:none}@page{size:landscape}}</style><button onclick="window.print()">Печать / сохранить PDF</button><h1>'+escape(title)+'</h1><table>'+''.join('<tr>'+''.join('<td>'+escape(str(v))+'</td>' for v in r)+'</tr>' for r in rows[2:])+'</table></html>'
         return html.encode(),'text/html; charset=utf-8'
     raise ValueError('Неподдерживаемый формат')
+
+
+def invoice_html(doc):
+    """Invoice uses only saved document details, not mutable customer/company cards."""
+    d=doc['data']
+    def e(x):return escape(str(x or '—'))
+    def n(x):return f'{x:,.3f}'.rstrip('0').rstrip('.').replace(',',' ').replace('.',',')
+    def cash(x):return f'{x:,.2f}'.replace(',',' ').replace('.',',')
+    rows=[]
+    for i,line in enumerate(d['lines'],1):
+        rows.append(f"<tr><td>{i}</td><td>{e(line['name'])}</td><td>{e(line['unit'])}</td><td>{n(line['qty'])}</td><td>{cash(line.get('gross_price',line['price']))}</td><td>{n(d.get('discount_percent',0))}</td><td>{cash(line.get('line_total',line['qty']*line['price']))}</td></tr>")
+    note='<p>'+escape(doc['note'])+'</p>' if doc['note'] else ''
+    status='<p class="cancelled">ОТМЕНЕНА</p>' if doc.get('reversed') else ''
+    return (f'''<!doctype html><html lang="ru"><meta charset="utf-8"><title>Накладная № {doc['id']}</title>
+<style>body{{font:14px "Segoe UI",Arial;color:#20372f;margin:32px}}h1{{font-size:25px}}.parties{{display:grid;grid-template-columns:1fr 1fr;gap:30px;margin:25px 0}}.party{{border:1px solid #ddd;padding:16px}}p{{line-height:1.6}}table{{border-collapse:collapse;width:100%}}th,td{{padding:10px;border:1px solid #ccd6d3;text-align:right}}td:nth-child(2),th:nth-child(2){{text-align:left}}th{{background:#f3f6ef}}.total{{text-align:right;font-size:17px}}.sign{{display:flex;justify-content:space-between;margin-top:55px}}.cancelled{{color:#ad382d}}button{{padding:10px}}@media print{{button{{display:none}}@page{{size:A4 portrait;margin:14mm}}body{{margin:0}}}}</style>
+<button onclick="window.print()">Печать / сохранить PDF</button><h1>Товарная накладная № {doc['id']}</h1><p>Дата: {'.'.join(reversed(doc['date'].split('-')))} · Без НДС</p>{status}
+<div class="parties"><div class="party"><strong>Кто отгружает</strong><p>{e(d.get('sender_name',doc['responsible']))}<br>{e(d.get('sender_address'))}<br>Телефон: {e(d.get('sender_phone'))}</p></div>
+<div class="party"><strong>Кому отгружают</strong><p>{e(d['client_name'])}<br>Адрес доставки: {e(d.get('delivery_address'))}<br>Телефон: {e(d.get('delivery_phone'))}<br>Контактное лицо: {e(d.get('delivery_contact'))}</p></div></div>
+<p>Водитель: {e(d.get('driver_name'))} · Автомобиль: {e(d.get('vehicle'))}</p>
+<table><thead><tr><th>№</th><th>Наименование товара</th><th>Ед.</th><th>Количество</th><th>Цена до скидки, ₽</th><th>Скидка, %</th><th>Сумма, ₽</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+<p class="total">До скидки: {cash(d.get('subtotal',doc['total']))} ₽<br>Скидка {n(d.get('discount_percent',0))}%: {cash(d.get('discount_amount',0))} ₽<br><strong>Итого: {cash(doc['total'])} ₽</strong></p>
+{note}<div class="sign"><span>Отпустил: {e(doc['responsible'])} __________</span><span>Получил: __________________</span></div></html>''').encode('utf-8')

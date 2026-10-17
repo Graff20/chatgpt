@@ -31,7 +31,7 @@ jobs:
             for ($attempt = 0; $attempt -lt 20; $attempt++) {
               try {
                 $state = Invoke-RestMethod http://127.0.0.1:18765/api/state
-                if ($state.schema_version -eq 1) { $ready = $true; break }
+                if ($state.schema_version -eq 2) { $ready = $true; break }
               } catch { Start-Sleep -Seconds 1 }
             }
             if (-not $ready) { throw 'Packaged application failed readiness check' }

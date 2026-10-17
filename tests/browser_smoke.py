@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory() as td:
             page.locator('#employee').fill('Мария')
             page.locator('#employee').dispatch_event('change')
             # Every navigation route renders with populated data.
-            routes={'orders':'Заказы клиентов','production':'Производство','stock':'Склад и партии','catalog':'Номенклатура','recipes':'Технологические карты','partners':'Клиенты и поставщики','documents':'Документы','finance':'Финансы','analytics':'Аналитика','settings':'База и настройки'}
+            routes={'orders':'Заказы клиентов','production':'Производство','logistics':'Логистика','stock':'Склад и партии','catalog':'Номенклатура','recipes':'Технологические карты','partners':'Клиенты и поставщики','documents':'Документы','finance':'Финансы','analytics':'Аналитика','settings':'База и настройки'}
             for route,title in routes.items():
                 page.locator(f'#nav a[href="#{route}"]').click()
                 expect(page.locator('h1')).to_have_text(title)
@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory() as td:
             page.locator('[data-action="view-document"]').first.click()
             iframe=page.frame_locator('iframe')
             expect(iframe.locator('h1')).to_contain_text('Товарная накладная')
-            expect(iframe.get_by_text('1.037',exact=True)).to_be_visible()
+            expect(iframe.get_by_text('1,037',exact=True)).to_be_visible()
             page.locator('[data-action="close-modal"]').first.click()
             # Return quarantines the goods; release requires a separate decision.
             page.locator('[data-action="view-document"]').first.click()
@@ -116,6 +116,6 @@ with tempfile.TemporaryDirectory() as td:
             assert page.locator('#modal').bounding_box()['width']<=390
             assert not errors,errors
             browser.close()
-            print('Browser smoke passed: 11 pages, catalogue, recipe version, production, order, 1.037 kg shipment, return/quarantine/release, inventory/reversal, print, XLSX, mobile.')
+            print('Browser smoke passed: 12 pages, catalogue, recipe version, production, order, 1.037 kg shipment, return/quarantine/release, inventory/reversal, print, XLSX, mobile.')
     finally:
         server.shutdown();server.server_close();thread.join()

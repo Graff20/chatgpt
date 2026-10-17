@@ -103,10 +103,14 @@ class AccountingTests(unittest.TestCase):
         with self.assertRaises(ValidationError):self.shipment(order,1.5)
         self.assertEqual(before,self.state())
         self.store.save_partner({'id':self.client,'kind':'client','name':'Кафе','debt_limit':100})
+        shipped=self.shipment(order,1)  # Today's new receivable does not itself block dispatch.
+        with self.store.transaction() as c:
+            c.execute('UPDATE documents SET date=? WHERE id=?',((date.today()-timedelta(days=1)).isoformat(),shipped))
+        new_order=self.order()
         before=self.state()
-        with self.assertRaises(ValidationError):self.shipment(order,1)
+        with self.assertRaises(ValidationError):self.shipment(new_order,1)
         self.assertEqual(before,self.state())
-        self.shipment(order,1,override_reason='Согласовано директором')
+        self.shipment(new_order,1,override_reason='Согласовано директором')
     def test_payment_and_advance(self):
         self.store.money(dict(self.base,kind='payment',partner_id=self.client,amount=1000))
         self.receipt();self.produce();self.shipment(self.order(),1)

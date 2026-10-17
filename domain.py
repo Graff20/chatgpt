@@ -2,11 +2,16 @@
 import sqlite3
 import json
 import math
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from contextlib import contextmanager, closing
 
+SCHEMA_VERSION = 2
 EPS = 1e-7
+
+def money_round(value):
+    return float(Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 UNITS = {'кг', 'л', 'шт.', 'уп.'}
 
 class ValidationError(ValueError):
@@ -107,7 +112,28 @@ class Store:
                 if c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchone():
                     raise ValidationError('Неизвестная схема базы; автоматическое пересоздание запрещено')
                 c.executescript('BEGIN IMMEDIATE;\n' + SCHEMA + '\nPRAGMA user_version=1; COMMIT;')
-            elif version != 1:
+                version = 1
+            if version == 1:
+                # A consistent, recoverable backup precedes every upgrade of a user database.
+                backup = self.path.parent/'backups'/f'before-v2-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3'
+                backup.parent.mkdir(exist_ok=True)
+                with closing(sqlite3.connect(backup)) as target:
+                    c.backup(target)
+                c.executescript('''BEGIN IMMEDIATE;
+                    ALTER TABLE items ADD COLUMN track_expiry INTEGER NOT NULL DEFAULT 1;
+                    CREATE TABLE drivers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '', vehicle TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1);
+                    ALTER TABLE orders ADD COLUMN driver_id INTEGER REFERENCES drivers(id);
+                    ALTER TABLE orders ADD COLUMN route_position INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE orders ADD COLUMN delivery_address TEXT NOT NULL DEFAULT '';
+                    ALTER TABLE orders ADD COLUMN delivery_phone TEXT NOT NULL DEFAULT '';
+                    ALTER TABLE orders ADD COLUMN delivery_contact TEXT NOT NULL DEFAULT '';
+                    CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    INSERT INTO settings VALUES('company','{"name":"Моё производство","address":"","phone":"","inn":""}');
+                    CREATE TABLE day_closures(date TEXT PRIMARY KEY, responsible TEXT NOT NULL, created TEXT NOT NULL);
+                    PRAGMA user_version=2;
+                    COMMIT;''')
+                version = 2
+            if version != SCHEMA_VERSION:
                 raise ValidationError('Версия базы не поддерживается этим приложением')
 
     def connect(self):
@@ -177,10 +203,10 @@ class Store:
                     raise ValidationError('Потери должны быть меньше 100%')
         values = [name, kind, str(d.get('folder', '')), str(d.get('category', '')), unit,
                   number(d.get('minimum', 0), 'Минимум', False), number(d.get('price', 0), 'Цена', False),
-                  number(d.get('sale_price', 0), 'Цена продажи', False), number(d.get('shelf_hours', 24), 'Срок годности'),
+                  number(d.get('sale_price', 0), 'Цена продажи', False), number(d.get('shelf_hours') or 24, 'Срок годности') if d.get('track_expiry', True) else 0,
                   mode, dumps(losses), number(d.get('pack_size', 1), 'Состав упаковки'), str(d.get('notes', '')),
-                  int(bool(d.get('active', True)))]
-        cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active'
+                  int(bool(d.get('active', True))), int(bool(d.get('track_expiry', True)))]
+        cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active,track_expiry'
         with self.transaction() as c:
             if d.get('id'):
                 old = self.one(c, 'items', d['id'])
@@ -296,9 +322,12 @@ class Store:
         return c.execute('INSERT INTO documents(kind,date,partner_id,responsible,note,total,cost,data,created) VALUES(?,?,?,?,?,?,?,?,?)',
             (kind, dt, d.get('partner_id') or None, required(d.get('responsible'),'Ответственный'), str(d.get('note','')), total, cost, dumps(data or {}), datetime.now().isoformat())).lastrowid
 
-    def add_lot(self, c, doc_id, item, qty, price, produced, expires, code='', supplier=None):
-        produced, expires = timestamp(produced), timestamp(expires)
-        if expires <= produced:
+    def add_lot(self, c, doc_id, item, qty, price, produced, expires, code='', supplier=None, preserve_expiry=False):
+        produced = timestamp(produced)
+        expires = timestamp(expires) if expires else ''
+        if item['track_expiry'] and not expires and not preserve_expiry:
+            raise ValidationError('Укажите срок годности партии или отключите его учёт в карточке')
+        if expires and expires <= produced:
             raise ValidationError('Срок годности должен быть позже даты изготовления')
         doc_date = self.one(c,'documents',doc_id)['date']
         if produced[:10] > doc_date:
@@ -310,11 +339,11 @@ class Store:
 
     def consume(self, c, doc_id, item_id, qty, at, lot_id=None, allow_expired=False):
         item = self.one(c,'items',item_id)
-        lots = c.execute('SELECT * FROM lots WHERE item_id=? AND qty>? '+('AND id=? ' if lot_id else '')+'ORDER BY expires,produced,id',
+        lots = c.execute('SELECT * FROM lots WHERE item_id=? AND qty>? '+('AND id=? ' if lot_id else '')+"ORDER BY (expires=''),expires,produced,id",
             (item_id,EPS,lot_id) if lot_id else (item_id,EPS)).fetchall()
         remaining, cost, used = qty, 0, []
         for lot in lots:
-            if not allow_expired and (lot['blocked'] or lot['expires'] <= at or lot['produced'] > at):
+            if not allow_expired and (lot['blocked'] or (lot['expires'] and lot['expires'] <= at) or lot['produced'] > at):
                 continue
             # Never consume stock that arrived after the business date.
             if self.one(c,'documents',lot['document_id'])['date'] > at[:10]:
@@ -362,7 +391,7 @@ class Store:
             dt = day(d.get('date',date.today().isoformat()))
             if made[:10] != dt or made > datetime.now().isoformat(timespec='minutes'):
                 raise ValidationError('Дата изготовления должна совпадать с датой выпуска и не быть в будущем')
-            expires = d.get('expires') or (datetime.fromisoformat(made)+timedelta(hours=item['shelf_hours'])).isoformat(timespec='minutes')
+            expires = (d.get('expires') or (datetime.fromisoformat(made)+timedelta(hours=item['shelf_hours'])).isoformat(timespec='minutes')) if item['track_expiry'] else ''
             ident = self.doc(c,'production',d)
             cost, inputs = 0,[]
             for iid, amount in needs.items():
@@ -407,7 +436,22 @@ class Store:
                 if tolerance > 100:
                     raise ValidationError('Допуск от 0 до 100%')
                 c.execute('INSERT INTO order_lines(order_id,item_id,qty,price,tolerance) VALUES(?,?,?,?,?)',(ident,item['id'],qty,number(line.get('price',item['sale_price']),'Цена',False),tolerance))
+            self.order_delivery(c,ident,d,client)
             return ident
+
+    def order_delivery(self,c,ident,d,client):
+        existing=self.one(c,'orders',ident)
+        driver_id=d.get('driver_id',existing['driver_id']) or None
+        if driver_id:
+            driver=self.one(c,'drivers',driver_id)
+            if not driver['active'] and driver['id']!=existing['driver_id']:
+                raise ValidationError('Водитель в архиве')
+        position=number(d.get('route_position',existing['route_position']), 'Порядок доставки',False)
+        if position!=int(position): raise ValidationError('Порядок доставки должен быть целым числом')
+        c.execute('UPDATE orders SET driver_id=?,route_position=?,delivery_address=?,delivery_phone=?,delivery_contact=? WHERE id=?',
+            (driver_id,int(position),str(d.get('delivery_address',existing['delivery_address'] or client['address'])),
+             str(d.get('delivery_phone',existing['delivery_phone'] or client['phone'])),
+             str(d.get('delivery_contact',existing['delivery_contact'] or client['contact'])),ident))
 
     def close_order(self,d):
         with self.transaction() as c:
@@ -425,6 +469,13 @@ class Store:
             if order['status'] != 'open':
                 raise ValidationError('Заказ закрыт')
             client = self.partner(c,order['client_id'],'client')
+            doc_date=day(d.get('date',date.today().isoformat()))
+            if c.execute('SELECT 1 FROM day_closures WHERE date=?',(doc_date,)).fetchone():
+                raise ValidationError('День уже закрыт. Новые отгрузки за эту дату запрещены')
+            self.order_delivery(c,order['id'],d,client)
+            order=self.one(c,'orders',order['id'])
+            discount=number(d.get('discount_percent',0),'Скидка',False)
+            if discount>100: raise ValidationError('Скидка от 0 до 100%')
             d = dict(d,partner_id=client['id'])
             ident = self.doc(c,'shipment',d)
             at = timestamp(d.get('at',datetime.now().isoformat(timespec='minutes')))
@@ -446,15 +497,24 @@ class Store:
                     raise ValidationError(f'{item["name"]}: превышен допуск {line["tolerance"]}%')
                 v,lots = self.consume(c,ident,item['id'],q,at)
                 cost += v
-                total += q*line['price']
+                gross_total=money_round(q*line['price'])
+                line_total=money_round(Decimal(str(gross_total))*(1-Decimal(str(discount))/100))
+                total += line_total
                 c.execute('UPDATE order_lines SET shipped=shipped+? WHERE id=?',(q,line['id']))
-                rows.append(dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=q,price=line['price'],lots=lots,line_id=line['id']))
+                rows.append(dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=q,price=line_total/q,gross_price=line['price'],gross_total=gross_total,line_total=line_total,discount_amount=money_round(gross_total-line_total),lots=lots,line_id=line['id']))
             if not rows:
                 raise ValidationError('Добавьте отгружаемое количество')
-            if client['debt_limit'] and self.balance(c,client['id'])+total > client['debt_limit']+0.005 and not d.get('override_reason'):
-                raise ValidationError('Превышен лимит долга. Нужна причина согласования отгрузки')
+            if client['debt_limit'] and self.settled_debt(c,client['id'])>=client['debt_limit']-EPS and not d.get('override_reason'):
+                raise ValidationError('Долг по итогам прошлых дней достиг лимита. Внесите оплату или укажите согласование отгрузки')
             due = (date.fromisoformat(day(d.get('date',date.today().isoformat())))+timedelta(days=client['payment_days'])).isoformat()
-            data = dict(order_id=order['id'],client_name=client['name'],due=due,lines=rows,override_reason=d.get('override_reason',''))
+            company=json.loads(c.execute("SELECT value FROM settings WHERE key='company'").fetchone()[0])
+            driver=self.one(c,'drivers',order['driver_id']) if order['driver_id'] else None
+            data = dict(order_id=order['id'],client_name=client['name'],due=due,lines=rows,override_reason=d.get('override_reason',''),
+                discount_percent=discount,subtotal=money_round(sum(r['gross_total'] for r in rows)),
+                discount_amount=money_round(sum(r['discount_amount'] for r in rows)),
+                sender_name=required(d.get('sender_name',company['name']),'Кто отгружает'),sender_address=company.get('address',''),sender_phone=company.get('phone',''),
+                delivery_address=order['delivery_address'],delivery_phone=order['delivery_phone'],delivery_contact=order['delivery_contact'],
+                driver_id=order['driver_id'],driver_name=driver['name'] if driver else '',driver_phone=driver['phone'] if driver else '',vehicle=driver['vehicle'] if driver else '')
             c.execute('UPDATE documents SET total=?,cost=?,data=? WHERE id=?',(round(total,2),cost,dumps(data),ident))
             outstanding = c.execute('SELECT 1 FROM order_lines WHERE order_id=? AND qty-shipped>?',(order['id'],EPS)).fetchone()
             if not outstanding or d.get('close_order'):
@@ -462,6 +522,29 @@ class Store:
                     raise ValidationError('Укажите причину закрытия недопоставленного заказа')
                 c.execute("UPDATE orders SET status='completed',note=note||? WHERE id=?",('\n'+str(d.get('short_reason','')),order['id']))
             return ident
+
+    def settled_debt(self,c,client_id,as_of=None):
+        as_of=day(as_of or date.today().isoformat())
+        closed=bool(c.execute('SELECT 1 FROM day_closures WHERE date=?',(as_of,)).fetchone())
+        reversed_ids=self.reversed_ids(c)
+        docs=[dict(r) for r in c.execute('SELECT * FROM documents WHERE partner_id=? AND date<=?',(client_id,as_of)) if r['id'] not in reversed_ids]
+        invoices={r['id']:r['total'] for r in docs if r['kind']=='shipment' and (r['date']<as_of or closed)}
+        for r in docs:
+            if r['kind']=='return':
+                invoice=json.loads(r['data'])['shipment_id']
+                if invoice in invoices: invoices[invoice]-=r['total']
+        payments=sum(r['total'] for r in docs if r['kind']=='payment')
+        return money_round(max(0,sum(invoices.values())-payments))
+
+    def close_day(self,d):
+        dt=day(d.get('date',date.today().isoformat()))
+        if dt>date.today().isoformat():raise ValidationError('Нельзя закрыть будущий день')
+        with self.transaction() as c:
+            who=required(d.get('responsible'),'Ответственный')
+            if c.execute('SELECT 1 FROM day_closures WHERE date=?',(dt,)).fetchone():
+                raise ValidationError('Этот день уже закрыт')
+            c.execute('INSERT INTO day_closures VALUES(?,?,?)',(dt,who,datetime.now().isoformat()))
+        return dt
 
     def reversed_ids(self,c):
         return {json.loads(r[0])['target_id'] for r in c.execute("SELECT data FROM documents WHERE kind='reversal'")}
@@ -511,12 +594,14 @@ class Store:
             reason=required(d.get('reason'),'Причина возврата')
             reversed_ids=self.reversed_ids(c)
             previous={}
+            previous_values={}
             for row in c.execute("SELECT id,data FROM documents WHERE kind='return'"):
                 if row['id'] in reversed_ids:continue
                 prior=json.loads(row['data'])
                 if prior['shipment_id']==original['id']:
                     for line in prior['lines']:
                         previous[line['line_id']]=previous.get(line['line_id'],0)+line['qty']
+                        previous_values[line['line_id']]=previous_values.get(line['line_id'],0)+line.get('line_total',line['qty']*line['price'])
             d=dict(d,partner_id=original['partner_id'])
             ident=self.doc(c,'return',d)
             total,cost,rows,seen=0,0,[],set()
@@ -533,13 +618,15 @@ class Store:
                     used_skip=min(skip,old['qty']);skip-=used_skip
                     take=min(remain,old['qty']-used_skip)
                     if take<=EPS:continue
-                    lid=self.add_lot(c,ident,it,take,old['unit_cost'],old['produced'],old['expires'],f'В-{ident}-{old["lot_id"]}')
+                    lid=self.add_lot(c,ident,it,take,old['unit_cost'],old['produced'],old['expires'],f'В-{ident}-{old["lot_id"]}',preserve_expiry=True)
                     c.execute('UPDATE lots SET blocked=1 WHERE id=?',(lid,))
                     lots.append(dict(lot_id=lid,qty=take,unit_cost=old['unit_cost'],produced=old['produced'],expires=old['expires']))
                     remain-=take;cost+=take*old['unit_cost']
                     if remain<=EPS:break
-                total+=q*line['price']
-                rows.append(dict(item_id=it['id'],name=it['name'],unit=it['unit'],qty=q,price=line['price'],lots=lots,line_id=line['line_id']))
+                remaining_value=money_round(line.get('line_total',line['qty']*line['price'])-previous_values.get(line['line_id'],0))
+                line_total=remaining_value if abs(q+already-line['qty'])<EPS else min(remaining_value,money_round(q*line['price']))
+                total+=line_total
+                rows.append(dict(item_id=it['id'],name=it['name'],unit=it['unit'],qty=q,price=line['price'],line_total=line_total,lots=lots,line_id=line['line_id']))
             if not rows:raise ValidationError('Добавьте количество возврата')
             c.execute('UPDATE documents SET total=?,cost=?,data=? WHERE id=?',(round(total,2),cost,dumps(dict(shipment_id=original['id'],client_name=data['client_name'],reason=reason,lines=rows)),ident))
             return ident
@@ -548,7 +635,7 @@ class Store:
         with self.transaction() as c:
             lot=self.one(c,'lots',d.get('lot_id'))
             if not lot['blocked']:raise ValidationError('Партия уже доступна')
-            if lot['expires']<=datetime.now().isoformat(timespec='minutes'):
+            if lot['expires'] and lot['expires']<=datetime.now().isoformat(timespec='minutes'):
                 raise ValidationError('Просроченную партию нельзя допустить к продаже')
             reason=required(d.get('reason'),'Основание допуска')
             ident=self.doc(c,'release',d,data={'lot_id':lot['id'],'reason':reason,'name':self.one(c,'items',lot['item_id'])['name']})
@@ -565,7 +652,8 @@ class Store:
                 raise ValidationError('Сумма должна быть не меньше 0,01 ₽')
             if kind == 'payment':
                 client = self.partner(c,d.get('partner_id'),'client')
-                data = {'client_name':client['name']}
+                driver=self.one(c,'drivers',d['driver_id']) if d.get('driver_id') else None
+                data = {'client_name':client['name'],'driver_id':driver['id'] if driver else None,'driver_name':driver['name'] if driver else ''}
             else:
                 d = dict(d,partner_id=None)
                 data = {'category':required(d.get('category'),'Статья расхода')}
@@ -614,14 +702,14 @@ class Store:
         with closing(self.connect()) as c:
             c.execute('BEGIN')
             now=datetime.now().isoformat(timespec='minutes')
-            result={t:[dict(r) for r in c.execute('SELECT * FROM '+t+' ORDER BY id')] for t in ('items','partners','recipes','lots','orders','order_lines','documents')}
+            result={t:[dict(r) for r in c.execute('SELECT * FROM '+t+' ORDER BY id')] for t in ('items','partners','recipes','lots','orders','order_lines','documents','drivers')}
             for r in result['recipes']:
                 r['lines']=json.loads(r['lines'])
             for i in result['items']:
                 i['losses']=json.loads(i['losses'])
                 i['planned_cost']=self.planned_cost(c,i['id'])
-                i['available']=sum(l['qty'] for l in result['lots'] if l['item_id']==i['id'] and not l['blocked'] and l['produced']<=now<l['expires'])
-                i['expired']=sum(l['qty'] for l in result['lots'] if l['item_id']==i['id'] and l['expires']<=now)
+                i['available']=sum(l['qty'] for l in result['lots'] if l['item_id']==i['id'] and not l['blocked'] and l['produced']<=now and (not l['expires'] or now<l['expires']))
+                i['expired']=sum(l['qty'] for l in result['lots'] if l['item_id']==i['id'] and l['expires'] and l['expires']<=now)
                 i['demand']=sum(max(0,l['qty']-l['shipped']) for l in result['order_lines'] if l['item_id']==i['id'] and any(o['id']==l['order_id'] and o['status']=='open' for o in result['orders']))
             reversed_ids=self.reversed_ids(c)
             for doc in result['documents']:
@@ -631,6 +719,8 @@ class Store:
             for p in result['partners']:
                 if p['kind']!='client': continue
                 p['balance']=self.balance(c,p['id'])
+                p['debt']=self.settled_debt(c,p['id'])
+                p['pending_today']=money_round(max(0,p['balance']-p['debt']))
                 funds=sum(x['total'] for x in result['documents'] if x['partner_id']==p['id'] and x['kind']=='payment' and not x['reversed'])
                 overdue=0
                 for doc in sorted((x for x in result['documents'] if x['partner_id']==p['id'] and x['kind']=='shipment' and not x['reversed']),key=lambda x:(x['date'],x['id'])):
@@ -640,15 +730,18 @@ class Store:
                     amount=round(invoice-paid,2)
                     due=json.loads(doc['data'])['due']
                     if amount>0:
-                        late=due<date.today().isoformat()
+                        pending=doc['date']==date.today().isoformat() and not c.execute('SELECT 1 FROM day_closures WHERE date=?',(doc['date'],)).fetchone()
+                        late=not pending and due<date.today().isoformat()
                         overdue+=amount if late else 0
-                        debts.append(dict(client=p['name'],client_id=p['id'],document_id=doc['id'],date=doc['date'],due=due,amount=amount,overdue=late))
+                        debts.append(dict(client=p['name'],client_id=p['id'],document_id=doc['id'],date=doc['date'],due=due,amount=amount,overdue=late,pending=pending))
                 p['overdue']=round(overdue,2)
             result['debts']=debts
+            result['company']=json.loads(c.execute("SELECT value FROM settings WHERE key='company'").fetchone()[0])
+            result['day_closed']=bool(c.execute('SELECT 1 FROM day_closures WHERE date=?',(date.today().isoformat(),)).fetchone())
             for doc in result['documents']:
                 doc['data']=json.loads(doc['data'])
             result['now']=now
-            result['schema_version']=1
+            result['schema_version']=SCHEMA_VERSION
             return result
 
     def plan(self,due):
@@ -660,7 +753,7 @@ class Store:
                 item=self.one(c,'items',line['item_id'])
                 # Earlier unfulfilled orders consume availability first. Exclude expired-by-target lots.
                 prior=c.execute("SELECT coalesce(sum(max(0,l.qty-l.shipped)),0) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE o.status='open' AND substr(o.due,1,10)<? AND l.item_id=?",(due,item['id'])).fetchone()[0]
-                available=c.execute('SELECT coalesce(sum(qty),0) FROM lots WHERE item_id=? AND expires>? AND blocked=0 AND produced<=?',(item['id'],due+'T23:59',datetime.now().isoformat(timespec='minutes'))).fetchone()[0]
+                available=c.execute("SELECT coalesce(sum(qty),0) FROM lots WHERE item_id=? AND (expires='' OR expires>?) AND blocked=0 AND produced<=?",(item['id'],due+'T23:59',datetime.now().isoformat(timespec='minutes'))).fetchone()[0]
                 free=max(0,available-prior); need=max(0,line['qty']-free)
                 error=''
                 if need>EPS:
@@ -672,6 +765,51 @@ class Store:
             for iid,q in ingredients.items():
                 item=self.one(c,'items',iid)
                 if item['unit'] in ('шт.','уп.'): q=math.ceil(q-EPS)
-                available=c.execute('SELECT coalesce(sum(qty),0) FROM lots WHERE item_id=? AND expires>? AND produced<=? AND blocked=0',(iid,datetime.now().isoformat(timespec='minutes'),datetime.now().isoformat(timespec='minutes'))).fetchone()[0]
+                available=c.execute("SELECT coalesce(sum(qty),0) FROM lots WHERE item_id=? AND (expires='' OR expires>?) AND produced<=? AND blocked=0",(iid,datetime.now().isoformat(timespec='minutes'),datetime.now().isoformat(timespec='minutes'))).fetchone()[0]
                 inputs.append(dict(name=item['name'],unit=item['unit'],qty=q,available=available,shortage=max(0,q-available)))
             return dict(date=due,products=rows,ingredients=inputs)
+
+    def save_driver(self,d):
+        name=required(d.get('name'),'Имя водителя')
+        values=(name,str(d.get('phone','')),str(d.get('vehicle','')),int(bool(d.get('active',True))))
+        with self.transaction() as c:
+            if d.get('id'):
+                self.one(c,'drivers',d['id'])
+                c.execute('UPDATE drivers SET name=?,phone=?,vehicle=?,active=? WHERE id=?',values+(d['id'],))
+                return d['id']
+            return c.execute('INSERT INTO drivers(name,phone,vehicle,active) VALUES(?,?,?,?)',values).lastrowid
+
+    def save_company(self,d):
+        company={'name':required(d.get('name'),'Наименование отправителя')}
+        company.update({k:str(d.get(k,'')) for k in ('address','phone','inn')})
+        with self.transaction() as c:
+            c.execute("UPDATE settings SET value=? WHERE key='company'",(dumps(company),))
+        return 1
+
+    def assign_delivery(self,d):
+        with self.transaction() as c:
+            order=self.one(c,'orders',d.get('order_id'))
+            self.order_delivery(c,order['id'],d,self.partner(c,order['client_id'],'client'))
+            return order['id']
+
+    def route(self,dt,driver_id=None):
+        dt=day(dt)
+        state=self.snapshot()
+        orders=[o for o in state['orders'] if o['due'][:10]==dt and o['status']!='closed' and (driver_id is None or (o['driver_id'] or 0)==int(driver_id))]
+        orders.sort(key=lambda o:(o['driver_id'] or 0,o['route_position'] or 999999,o['due'],o['id']))
+        stops=[]
+        for o in orders:
+            client=next(p for p in state['partners'] if p['id']==o['client_id'])
+            driver=next((d for d in state['drivers'] if d['id']==o['driver_id']),None)
+            docs=[d for d in state['documents'] if d['kind']=='shipment' and not d['reversed'] and d['data']['order_id']==o['id']]
+            goods=[]
+            for l in state['order_lines']:
+                if l['order_id']!=o['id']:continue
+                it=next(i for i in state['items'] if i['id']==l['item_id'])
+                goods.append({'name':it['name'],'unit':it['unit'],'planned':l['qty'],'actual':l['shipped']})
+            stops.append(dict(order_id=o['id'],driver_id=o['driver_id'],driver_name=driver['name'] if driver else 'Не назначен',driver_phone=driver['phone'] if driver else '',vehicle=driver['vehicle'] if driver else '',
+                position=o['route_position'],due=o['due'],client=client['name'],address=o['delivery_address'] or client['address'],phone=o['delivery_phone'] or client['phone'],contact=o['delivery_contact'] or client['contact'],
+                goods=goods,invoice_numbers=[d['id'] for d in docs],total=money_round(sum(d['total'] for d in docs)),
+                to_collect=money_round(sum(x['amount'] for x in state['debts'] if x['document_id'] in {doc['id'] for doc in docs})),
+                planned_total=money_round(sum(l['qty']*l['price'] for l in state['order_lines'] if l['order_id']==o['id'])),note=o['note']))
+        return {'date':dt,'company':state['company'],'stops':stops}

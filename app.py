@@ -13,8 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from contextlib import closing
-from domain import Store, ValidationError, dumps
-from exports import document_table, export
+from domain import Store, ValidationError, dumps, SCHEMA_VERSION
+from exports import document_table, export, invoice_html
 
 ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
@@ -22,7 +22,7 @@ LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='Ceh/0.1'
+    server_version='Ceh/0.2'
     def log_message(self,fmt,*args):
         # Do not log query parameters or request bodies.
         print(f'[{datetime.now():%H:%M:%S}] {args[1] if len(args)>1 else "request"}')
@@ -49,6 +49,7 @@ class Handler(BaseHTTPRequestHandler):
     def get(self):
         u=urlparse(self.path); q=parse_qs(u.query); path=u.path
         if path=='/api/state': return self.send(200,self.store.snapshot())
+        if path=='/api/route': return self.send(200,self.store.route(q.get('date',[date.today().isoformat()])[0],q.get('driver_id',[None])[0]))
         if path=='/api/plan': return self.send(200,self.store.plan(q.get('date',[date.today().isoformat()])[0]))
         if path=='/api/backup':
             target=self.server.data/'backups'/f'manual-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3'
@@ -57,6 +58,10 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/export':
             state=self.store.snapshot(); typ=q.get('type',['stock'])[0]; fmt=q.get('format',['xlsx'])[0]
             title,rows=self.export_rows(state,typ,q)
+            if typ=='document' and fmt=='html':
+                doc=next((d for d in state['documents'] if d['id']==int(q.get('id',['0'])[0])),None)
+                if doc and doc['kind']=='shipment':
+                    return self.send(200,invoice_html(doc),'text/html; charset=utf-8')
             content,mime=export(title,rows,fmt)
             return self.send(200,content,mime,None if fmt=='html' else 'ceh-export.'+fmt)
         files={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}
@@ -97,7 +102,15 @@ class Handler(BaseHTTPRequestHandler):
             rows += [[],['Сырьё','Требуется','Доступно сейчас','Дефицит','Ед.']]
             rows += [[r['name'],r['qty'],r['available'],r['shortage'],r['unit']] for r in plan['ingredients']]
             return 'Наряд на '+plan['date'],rows
-        if typ=='debts': return 'Задолженность',[['Клиент','Накладная','Дата','Срок оплаты','Долг, ₽','Просрочен']]+[[d['client'],d['document_id'],d['date'],d['due'],d['amount'],'Да' if d['overdue'] else 'Нет'] for d in state['debts']]
+        if typ=='route':
+            route=self.store.route(q.get('date',[date.today().isoformat()])[0],q.get('driver_id',[None])[0])
+            rows=[['Отправитель',route['company']['name']],['Дата',route['date']],[],['Водитель / авто','Порядок','Заказ / время','Клиент','Адрес','Телефон','Контактное лицо','Накладные','Продукция: план / факт','Сумма накладных, ₽','Осталось оплатить, ₽','Отметка / подпись']]
+            for n,stop in enumerate(route['stops'],1):
+                goods='; '.join(f"{g['name']}: {g['planned']} / {g['actual']} {g['unit']}" for g in stop['goods'])
+                rows.append([stop['driver_name']+' · '+stop['driver_phone']+' / '+stop['vehicle'],stop['position'] or n,str(stop['order_id'])+' / '+stop['due'][11:],stop['client'],stop['address'],stop['phone'],stop['contact'],', '.join(map(str,stop['invoice_numbers'])),goods,stop['total'],stop['to_collect'],''])
+            rows.append(['Итого','','','','','','','','',round(sum(s['total'] for s in route['stops']),2),round(sum(s['to_collect'] for s in route['stops']),2),''])
+            return 'Маршрутный лист — '+route['date'],rows
+        if typ=='debts': return 'Задолженность',[['Клиент','Накладная','Дата','Срок оплаты','Долг, ₽','Просрочен']]+[[d['client'],d['document_id'],d['date'],d['due'],d['amount'],'К оплате сегодня' if d['pending'] else 'Просрочен' if d['overdue'] else 'Долг'] for d in state['debts']]
         if typ=='analytics':
             start=q.get('from',['0001-01-01'])[0]; end=q.get('to',['9999-12-31'])[0]
             group=q.get('group',['product'])[0]
@@ -110,7 +123,7 @@ class Handler(BaseHTTPRequestHandler):
                     # Units stay separate even when grouping by client/date.
                     label=l['name'] if group=='product' else doc['data']['client_name'] if group=='client' else doc['date']
                     key=(label,l['unit']); r=result.setdefault(key,[label,l['unit'],0,0,0])
-                    r[2]+=sign*l['qty']; r[3]+=sign*l['qty']*l['price']; r[4]+=sign*sum(x['qty']*x['unit_cost'] for x in l['lots'])
+                    r[2]+=sign*l['qty']; r[3]+=sign*l.get('line_total',l['qty']*l['price']); r[4]+=sign*sum(x['qty']*x['unit_cost'] for x in l['lots'])
             all_columns={'qty':(2,'Количество'),'revenue':(3,'Выручка, ₽'),'cost':(4,'Себестоимость, ₽'),'profit':(5,'Валовая прибыль, ₽')}
             selected=[k for k in q.get('columns',['qty,revenue,cost,profit'])[0].split(',') if k in all_columns]
             return 'Продажи и валовая прибыль',[['Группа','Ед.']+[all_columns[k][1] for k in selected]]+[[r[0],r[1]]+[(r+[r[3]-r[4]])[all_columns[k][0]] for k in selected] for r in result.values()]
@@ -122,7 +135,7 @@ class Handler(BaseHTTPRequestHandler):
             return 'История закупочных цен',rows
         if typ=='stock':
             rows=[['Партия','Товар','Ед.','Изготовлено','Годен до','Остаток','Цена партии, ₽','Статус']]
-            rows += [[l['code'],items[l['item_id']]['name'],items[l['item_id']]['unit'],l['produced'],l['expires'],l['qty'],l['unit_cost'],'Карантин' if l['blocked'] else 'Просрочено' if l['expires']<=state['now'] else 'Годно'] for l in state['lots'] if l['qty']>1e-7]
+            rows += [[l['code'],items[l['item_id']]['name'],items[l['item_id']]['unit'],l['produced'],l['expires'] or 'Без срока',l['qty'],l['unit_cost'],'Карантин' if l['blocked'] else 'Просрочено' if l['expires'] and l['expires']<=state['now'] else 'Годно'] for l in state['lots'] if l['qty']>1e-7]
             return 'Остатки / ведомость для ревизии',rows
         raise ValidationError('Неверный тип выгрузки')
     def do_POST(self):
@@ -139,7 +152,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(d,dict): raise ValidationError('Ожидается объект JSON')
             with LOCK:
                 if self.path=='/api/restore': return self.restore(d)
-                actions={'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
+                actions={'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
                     '/api/receipt':self.store.receipt,'/api/production':self.store.production,'/api/orders':self.store.save_order,
                     '/api/close-order':self.store.close_order,'/api/shipment':self.store.shipment,'/api/money':self.store.money,
                     '/api/writeoff':self.store.writeoff,'/api/inventory':self.store.inventory}
@@ -162,7 +175,7 @@ class Handler(BaseHTTPRequestHandler):
             with closing(sqlite3.connect(f'file:{temp.as_posix()}?mode=ro',uri=True)) as c:
                 c.execute('PRAGMA trusted_schema=OFF')
                 if c.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise ValidationError('Повреждённая база')
-                if c.execute('PRAGMA user_version').fetchone()[0]!=1: raise ValidationError('Неподдерживаемая версия базы')
+                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
                 for table in ('items','partners','lots','movements','recipes','documents','orders','order_lines'):
                     if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone(): raise ValidationError('Неверная структура базы')
                 if c.execute('PRAGMA foreign_key_check').fetchone(): raise ValidationError('Повреждены связи базы')
