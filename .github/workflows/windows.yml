@@ -1,0 +1,42 @@
+name: Windows checks and portable build
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Accounting and HTTP tests
+        run: python -m unittest discover -s tests -v
+      - name: Compile
+        run: python -m py_compile app.py domain.py exports.py demo.py
+      - name: Build portable Windows application
+        run: |
+          python -m pip install pyinstaller==6.16.0
+          python -m PyInstaller --noconfirm --clean --onedir --name Ceh --add-data "static;static" app.py
+      - name: Smoke packaged executable
+        shell: pwsh
+        run: |
+          $cehProcess = Start-Process -FilePath dist/Ceh/Ceh.exe -ArgumentList '--port','18765','--data',"$env:RUNNER_TEMP/ceh-smoke" -PassThru
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+              try {
+                $state = Invoke-RestMethod http://127.0.0.1:18765/api/state
+                if ($state.schema_version -eq 1) { $ready = $true; break }
+              } catch { Start-Sleep -Seconds 1 }
+            }
+            if (-not $ready) { throw 'Packaged application failed readiness check' }
+          } finally { Stop-Process -Id $cehProcess.Id -ErrorAction SilentlyContinue }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ceh-Windows-portable
+          path: dist/Ceh/
