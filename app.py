@@ -8,6 +8,7 @@ import threading
 import traceback
 import sys
 import webbrowser
+from html import escape
 from datetime import datetime, date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,8 +22,33 @@ DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) e
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
 
+ASSETS=('index.html','app.js','style.css')
+
+def check_assets():
+    missing=[]
+    for name in ASSETS:
+        try:
+            (ROOT/'static'/name).read_bytes()
+        except OSError:
+            missing.append('static/'+name)
+    if missing:
+        raise ValidationError('Не найдены или недоступны файлы интерфейса: '+', '.join(missing)+
+            '. Распакуйте всю папку программы, включая static. Папку data сохраните. База не открывалась.')
+
+def recovery_page(filename):
+    return ('''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Цех — восстановление интерфейса</title><style>body{font:16px "Segoe UI",Arial;background:#f4f5f0;color:#20372f;margin:0;padding:40px 20px}main{max-width:760px;margin:auto;background:white;border:1px solid #dce2d9;padding:30px;border-radius:12px}li{margin:14px 0;line-height:1.6}a{color:#1c5947}code{background:#eef3e9;padding:3px 5px}</style><main>
+<h1>Не удалось открыть файлы интерфейса</h1><p>Файл <code>'''+escape(filename)+'''</code> отсутствует или недоступен. Это сообщение само по себе не означает потерю базы.</p>
+<p><a href="/api/backup">Скачать резервную копию текущей базы</a></p><ol>
+<li>Остановите все окна запуска «Цех» сочетанием Ctrl+C.</li>
+<li>Сохраните всю папку <code>data</code> отдельно.</li>
+<li>Распакуйте полный архив программы. Рядом с <code>app.py</code> должна быть папка <code>static</code> с файлами <code>index.html</code>, <code>app.js</code>, <code>style.css</code>.</li>
+<li>Перенесите вашу сохранённую папку <code>data</code> в папку программы. Не заменяйте её пустой базой.</li>
+<li>Запустите один экземпляр <code>start.bat</code>, затем обновите страницу.</li></ol>
+<p>Если ошибка повторится, передайте последние строки ошибки из окна запуска. Не удаляйте <code>data</code>.</p></main></html>''').encode('utf-8')
+
 class Handler(BaseHTTPRequestHandler):
-    server_version='Ceh/0.2'
+    server_version='Ceh/0.2.1'
     def log_message(self,fmt,*args):
         # Do not log query parameters or request bodies.
         print(f'[{datetime.now():%H:%M:%S}] {args[1] if len(args)>1 else "request"}')
@@ -68,7 +94,13 @@ class Handler(BaseHTTPRequestHandler):
         if path not in files: return self.send(404,{'error':'Не найдено'})
         p=ROOT/'static'/files[path]
         mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8'}[p.suffix]
-        self.send(200,p.read_bytes(),mime)
+        try:
+            content=p.read_bytes()
+        except OSError:
+            traceback.print_exc()
+            if path=='/': return self.send(503,recovery_page('static/'+files[path]),'text/html; charset=utf-8')
+            return self.send(503,{'error':'Недоступен файл static/'+files[path]+'. Восстановите папку static из полного архива программы.'})
+        self.send(200,content,mime)
     def export_rows(self,state,typ,q):
         items={i['id']:i for i in state['items']}
         ident=int(q.get('id',['0'])[0])
@@ -198,11 +230,20 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads=True
     def __init__(self,address,data):
-        self.data=Path(data).resolve(); self.data.mkdir(parents=True,exist_ok=True)
-        self.store=Store(self.data/'ceh.sqlite3')
-        (self.data/'backups').mkdir(exist_ok=True)
-        self.backup(self.data/'backups'/f'start-{date.today().isoformat()}.sqlite3',replace=False)
-        super().__init__(address,Handler)
+        check_assets()
+        self.data=Path(data).resolve()
+        super().__init__(address,Handler,bind_and_activate=False)
+        try:
+            # Bind first: a second process must not create or migrate another database.
+            self.server_bind()
+            self.data.mkdir(parents=True,exist_ok=True)
+            self.store=Store(self.data/'ceh.sqlite3')
+            (self.data/'backups').mkdir(exist_ok=True)
+            self.backup(self.data/'backups'/f'start-{date.today().isoformat()}.sqlite3',replace=False)
+            self.server_activate()
+        except Exception:
+            self.server_close()
+            raise
     def backup(self,target,replace=True):
         if target.exists() and not replace:return
         with closing(self.store.connect()) as src, closing(sqlite3.connect(target)) as dst: src.backup(dst)
@@ -212,7 +253,15 @@ def main():
     p.add_argument('--host',default='127.0.0.1'); p.add_argument('--port',type=int,default=8765)
     p.add_argument('--data',default=str(DATA_ROOT/'data')); p.add_argument('--open',action='store_true')
     args=p.parse_args()
-    server=Server((args.host,args.port),args.data)
+    try:
+        server=Server((args.host,args.port),args.data)
+    except ValidationError as e:
+        print('Запуск отменён:',e)
+        return 1
+    except OSError as e:
+        print('Не удалось запустить сервер:',e)
+        print('Если порт занят, остановите прежнее окно запуска и повторите. Папку data не удаляйте.')
+        return 1
     print(f'Цех: http://127.0.0.1:{server.server_port}\nБаза: {server.store.path}\nДля остановки: Ctrl+C')
     if args.host=='0.0.0.0': print('Сетевой режим: доступ разрешён в доверенной локальной сети. Не открывайте этот порт в интернет.')
     if args.open: webbrowser.open(f'http://127.0.0.1:{server.server_port}')
@@ -220,4 +269,4 @@ def main():
     except KeyboardInterrupt: pass
     finally: server.server_close()
 
-if __name__=='__main__':main()
+if __name__=='__main__':sys.exit(main())
