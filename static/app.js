@@ -10,6 +10,8 @@ const expiryDate=d=>d?fmtDate(d):'Без срока';
 const lotSort=(a,b)=>(a.expires||'9999').localeCompare(b.expires||'9999');
 const fmtDate=d=>d?new Date(d.length===10?d+'T00:00':d).toLocaleString('ru-RU',d.length===10?{day:'2-digit',month:'2-digit',year:'numeric'}:{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
 let logisticsDate=localDate(),logisticsDriver='';
+const CLIENT_SCHEMA=2;
+let dataReady=false,loadProblem=null;
 let S={},page='dashboard',filters={},planDate=today(),report={group:'product',from:localDate(new Date(new Date().getFullYear(),new Date().getMonth(),1)),to:today(),columns:['qty','revenue','cost','profit']};
 const kinds={raw:'Сырьё',semi:'Полуфабрикат',finished:'Готовая продукция',packaging:'Упаковка'};
 const docKinds={receipt:'Приёмка сырья',production:'Выпуск продукции',shipment:'Товарная накладная',writeoff:'Списание',inventory:'Ревизия',payment:'Оплата',expense:'Расход',reversal:'Отмена документа',return:'Возврат клиента',release:'Допуск партии'};
@@ -27,8 +29,18 @@ const options=(arr,selected,placeholder='Выберите…')=>`<option value="
 const unitOptions=(selected)=>['кг','г','л','мл','шт.','уп.'].map(x=>`<option ${x===selected?'selected':''}>${x}</option>`).join('');
 const sellable=()=>S.items.filter(i=>i.active&&['finished','semi'].includes(i.kind)&&i.mode==='stock');
 const exportButtons=(type,id='',extra='')=>`<div class="actions"><a class="btn small" target="_blank" rel="noopener" href="/api/export?type=${type}&id=${id}&format=html${extra}">Печать / PDF</a>${['xlsx','docx','csv','json'].map(f=>`<a class="btn small" href="/api/export?type=${type}&id=${id}&format=${f}${extra}">${f.toUpperCase()}</a>`).join('')}</div>`;
-async function api(path,data){const r=await fetch('/api/'+path,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const result=await r.json();if(!r.ok)throw Error(result.error||'Ошибка запроса');return result;}
-async function load(){S=await api('state');}
+async function api(path,data){if(data!==undefined&&!dataReady)throw loadProblem||Error('Данные программы ещё не загружены');const r=await fetch('/api/'+path,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const result=await r.json();if(!r.ok)throw Error(result.error||'Ошибка запроса');return result;}
+function validateState(state){
+ const arrays=['items','partners','recipes','lots','orders','order_lines','documents','drivers','debts'];
+ if(!state||state.schema_version!==CLIENT_SCHEMA||arrays.some(k=>!Array.isArray(state[k]))||!state.company){
+  const error=Error('Интерфейс и запущенный сервер разных версий. Остановите старое окно Python через Ctrl+C, запустите start.bat из обновлённой папки и обновите страницу через Ctrl+F5. Папку data не удаляйте.');
+  error.code='VERSION_MISMATCH';throw error;
+ }
+ return state;
+}
+function showLoadProblem(error){$('#content').innerHTML=`<section class="card"><div class="card-body"><h1>${error.code==='VERSION_MISMATCH'?'Нужно перезапустить сервер':'Не удалось загрузить программу'}</h1>${errHtml(error)}<p>Проверьте, что файлы app.py, domain.py, exports.py и папка static взяты из одного обновления.</p><p>Если прежние данные не видны, запустите diagnose.bat: он покажет найденные базы и количество записей. Базы не изменяются.</p></div></section>`;}
+async function load(){const state=await api('state');try{S=validateState(state);dataReady=true;loadProblem=null;}catch(error){dataReady=false;loadProblem=error;showLoadProblem(error);throw error;}}
+
 function toast(msg){$('#toast').textContent=msg;$('#toast').style.display='block';setTimeout(()=>$('#toast').style.display='none',4000);}
 async function refresh(){await load();await render();}
 function navigate(p){location.hash=p;}
@@ -40,6 +52,7 @@ function quantityInfo(i,due=now()){
  return {available,demand,free:Math.max(0,available-demand),first:valid.sort(lotSort)[0]};
 }
 async function render(){
+ if(!dataReady){if(loadProblem)showLoadProblem(loadProblem);return;}
  page=location.hash.slice(1)||'dashboard';if(!routes.some(x=>x[0]===page))page='dashboard';
  $('#nav').innerHTML=routes.map((r,n)=>(n===4?'<div class="nav-label">СПРАВОЧНИКИ</div>':n===8?'<div class="nav-label">УПРАВЛЕНИЕ</div>':'')+`<a href="#${r[0]}" class="${page===r[0]?'active':''}"><span class="sym">${r[1]}</span>${r[2]}</a>`).join('');
  $('#breadcrumb').textContent='Моё производство / '+routes.find(r=>r[0]===page)[2];
@@ -131,9 +144,9 @@ function analytics(){
  card('Отчёт о продажах',rows.length?table(['Группа','Ед.',...report.columns.map(k=>col[k])],rows.map(r=>`<tr><td><strong>${esc(r.label)}</strong></td><td>${esc(r.unit)}</td>${report.columns.map(k=>`<td>${k==='qty'?num(r[k]):rub(r[k])}</td>`).join('')}</tr>`)):empty('Нет продаж за период','Проведите отгрузку или измените даты отчёта.'),exportButtons('analytics','',extra))+
  card('История закупочных цен',table(['Дата','Сырьё','Поставщик','Цена за базовую единицу','Количество'],docs.filter(d=>d.kind==='receipt').reverse().flatMap(d=>d.data.lines.map(l=>`<tr><td>${fmtDate(d.date)}</td><td>${esc(l.name)}</td><td>${esc(d.data.supplier_name)}</td><td>${rub(l.price)} / ${esc(l.unit)}</td><td>${num(l.qty)} ${esc(l.unit)}</td></tr>`))),exportButtons('prices','',extra));
 }
-function settings(){return pageTop('База и настройки','Локальное хранение, резервные копии и безопасное восстановление.',btn('Реквизиты отправителя','edit-company'))+card('Кто отгружает',`<div class="card-body"><strong>${esc(S.company.name)}</strong><p>${esc(S.company.address)} · ${esc(S.company.phone)}</p><small>Эти реквизиты копируются в новую накладную. Старые накладные сохраняют свои реквизиты.</small></div>`)+
+function settings(){return pageTop('База и настройки','Локальное хранение, резервные копии и безопасное восстановление.',btn('Реквизиты отправителя','edit-company'))+card('Какая база открыта',`<div class="card-body"><p><strong>Файл базы:</strong> ${esc(S.runtime?.database_path||'Сервер не сообщает путь — перезапустите последнюю версию программы')}</p><p><strong>Папка программы:</strong> ${esc(S.runtime?.program_directory||'—')}</p><p>Сервер ${esc(S.runtime?.app_version||'старой версии')} · процесс ${esc(S.runtime?.pid||'—')} · запущен ${esc(S.runtime?.started_at||'—')}</p><p>Номенклатура: ${S.items.length} · контрагенты: ${S.partners.length} · заказы: ${S.orders.length} · документы: ${S.documents.length}</p><p class="help">Если путь не совпадает с вашей прежней папкой data, ничего не удаляйте. Diagnose.bat находит доступные базы и копии без изменения данных.</p></div>`)+card('Кто отгружает',`<div class="card-body"><strong>${esc(S.company.name)}</strong><p>${esc(S.company.address)} · ${esc(S.company.phone)}</p><small>Эти реквизиты копируются в новую накладную. Старые накладные сохраняют свои реквизиты.</small></div>`)+
  `<div class="grid-2">${card('Резервное копирование',`<div class="card-body"><p>Выгрузка содержит всю базу: каталоги, рецептуры, партии, документы, заказы и финансы.</p><a class="btn primary" href="/api/backup">↓ Скачать резервную копию</a><p class="help">Копия также сохраняется на серверном компьютере в data/backups. Автоматическая копия создаётся при первом запуске за день. Храните отдельную копию на другом носителе.</p></div>`)}${card('Восстановление',`<div class="card-body"><p>Заменяет текущую базу выбранной копией. Перед заменой программа сохранит текущие данные отдельно.</p><label class="field">Файл .sqlite3<input type="file" id="restore-file" accept=".sqlite3,.db"></label><p><input id="restore-confirm" placeholder="Введите ВОССТАНОВИТЬ"></p>${btn('Восстановить базу','restore','danger')}<p class="help">Попросите сотрудников завершить работу перед восстановлением. Лимит загрузки копии — 48 МБ.</p></div>`)}</div>`+
- card('О приложении',`<div class="card-body"><p><strong>Цех · версия 0.2.1</strong> — локальное приложение для кулинарного и кондитерского производства.</p><p class="sub">Схема базы: ${S.schema_version}. Документы проводятся атомарно; отрицательные остатки запрещены. Обмен с 1С отложен. Роли и пароли не предусмотрены; используйте доверенную локальную сеть.</p><p class="help">Для нескольких сотрудников запустите start-network.bat на основном компьютере. На остальных откройте адрес основного компьютера с портом 8765. База хранится только на основном компьютере.</p></div>`);}
+ card('О приложении',`<div class="card-body"><p><strong>Цех · версия 0.2.2</strong> — локальное приложение для кулинарного и кондитерского производства.</p><p class="sub">Схема базы: ${S.schema_version}. Документы проводятся атомарно; отрицательные остатки запрещены. Обмен с 1С отложен. Роли и пароли не предусмотрены; используйте доверенную локальную сеть.</p><p class="help">Для нескольких сотрудников запустите start-network.bat на основном компьютере. На остальных откройте адрес основного компьютера с портом 8765. База хранится только на основном компьютере.</p></div>`);}
 
 // Modal form helpers
 let saveHandler=null;
@@ -274,4 +287,4 @@ window.addEventListener('hashchange',()=>render().catch(e=>toast(e.message)));
 window.addEventListener('focus',()=>{if(!$('#modal').open)refresh().catch(e=>toast(e.message));});
 setInterval(()=>{if(!$('#modal').open&&!document.hidden)refresh().catch(()=>{});},30000);
 $('#content').innerHTML='<div class="loading">Загрузка локальной базы…</div>';
-refresh().catch(e=>$('#content').innerHTML=errHtml(e));
+refresh().catch(showLoadProblem);

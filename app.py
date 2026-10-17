@@ -21,6 +21,7 @@ ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
+APP_VERSION='0.2.2'
 
 ASSETS=('index.html','app.js','style.css')
 
@@ -48,7 +49,7 @@ def recovery_page(filename):
 <p>Если ошибка повторится, передайте последние строки ошибки из окна запуска. Не удаляйте <code>data</code>.</p></main></html>''').encode('utf-8')
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='Ceh/0.2.1'
+    server_version='Ceh/'+APP_VERSION
     def log_message(self,fmt,*args):
         # Do not log query parameters or request bodies.
         print(f'[{datetime.now():%H:%M:%S}] {args[1] if len(args)>1 else "request"}')
@@ -74,7 +75,11 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc(); self.send(500,{'error':'Ошибка сервера. Подробности в окне запуска.'})
     def get(self):
         u=urlparse(self.path); q=parse_qs(u.query); path=u.path
-        if path=='/api/state': return self.send(200,self.store.snapshot())
+        if path=='/api/runtime': return self.send(200,self.server.runtime_info())
+        if path=='/api/state':
+            state=self.store.snapshot()
+            state['runtime']=self.server.runtime_info()
+            return self.send(200,state)
         if path=='/api/route': return self.send(200,self.store.route(q.get('date',[date.today().isoformat()])[0],q.get('driver_id',[None])[0]))
         if path=='/api/plan': return self.send(200,self.store.plan(q.get('date',[date.today().isoformat()])[0]))
         if path=='/api/backup':
@@ -232,6 +237,7 @@ class Server(ThreadingHTTPServer):
     def __init__(self,address,data):
         check_assets()
         self.data=Path(data).resolve()
+        self.started_at=datetime.now().isoformat(timespec='seconds')
         super().__init__(address,Handler,bind_and_activate=False)
         try:
             # Bind first: a second process must not create or migrate another database.
@@ -244,6 +250,11 @@ class Server(ThreadingHTTPServer):
         except Exception:
             self.server_close()
             raise
+    def runtime_info(self):
+        return {'app_version':APP_VERSION,'schema_version':SCHEMA_VERSION,'pid':os.getpid(),
+                'started_at':self.started_at,'program_directory':str(DATA_ROOT.resolve()),
+                'data_directory':str(self.data),'database_path':str(self.store.path.resolve())}
+
     def backup(self,target,replace=True):
         if target.exists() and not replace:return
         with closing(self.store.connect()) as src, closing(sqlite3.connect(target)) as dst: src.backup(dst)
@@ -262,7 +273,7 @@ def main():
         print('Не удалось запустить сервер:',e)
         print('Если порт занят, остановите прежнее окно запуска и повторите. Папку data не удаляйте.')
         return 1
-    print(f'Цех: http://127.0.0.1:{server.server_port}\nБаза: {server.store.path}\nДля остановки: Ctrl+C')
+    print(f'Цех {APP_VERSION} · процесс {os.getpid()} · http://127.0.0.1:{server.server_port}\nПрограмма: {DATA_ROOT.resolve()}\nБаза: {server.store.path}\nДля остановки: Ctrl+C')
     if args.host=='0.0.0.0': print('Сетевой режим: доступ разрешён в доверенной локальной сети. Не открывайте этот порт в интернет.')
     if args.open: webbrowser.open(f'http://127.0.0.1:{server.server_port}')
     try: server.serve_forever()
