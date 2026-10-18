@@ -73,6 +73,7 @@ with tempfile.TemporaryDirectory() as td:
             page.get_by_role('button',name='Восстановить базу',exact=True).click()
             expect(page.locator('#toast')).to_contain_text('База восстановлена')
             page.locator('#nav a[href="#catalog"]').click()
+            page.get_by_role('button',name='Раскрыть всё').click()
             expect(page.get_by_text('Сахар из копии',exact=True)).to_be_visible()
             assert server.store.snapshot()['partners'][0]['name']=='Клиент из копии'
             assert list((root/'working-data'/'backups').glob('before-restore-*'))

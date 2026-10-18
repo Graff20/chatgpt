@@ -17,13 +17,13 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from contextlib import closing
 from domain import Store, ValidationError, dumps, SCHEMA_VERSION
-from exports import document_table, export, invoice_html
+from exports import document_table, export, invoice_html, receipt_html, production_html
 
 ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.2.5'
+APP_VERSION='0.3.0'
 
 ASSETS=('index.html','app.js','style.css')
 
@@ -93,6 +93,17 @@ class Handler(BaseHTTPRequestHandler):
             title,rows=self.export_rows(state,typ,q)
             if typ=='document' and fmt=='html':
                 doc=next((d for d in state['documents'] if d['id']==int(q.get('id',['0'])[0])),None)
+                if doc and doc['kind']=='production':
+                    lot=next((l for l in state['lots'] if l['id']==doc['data'].get('lot_id')),None)
+                    if lot:
+                        for key in ('produced','expires','code'):doc['data'].setdefault(key,lot[key])
+                    return self.send(200,production_html(doc),'text/html; charset=utf-8')
+                if doc and doc['kind']=='receipt':
+                    for line in doc['data']['lines']:
+                        lot=next((l for l in state['lots'] if l['id']==line.get('lot_id')),None)
+                        if lot:
+                            for key in ('produced','expires','code'):line.setdefault(key,lot[key])
+                    return self.send(200,receipt_html(doc),'text/html; charset=utf-8')
                 if doc and doc['kind']=='shipment':
                     return self.send(200,invoice_html(doc),'text/html; charset=utf-8')
             content,mime=export(title,rows,fmt)
@@ -119,14 +130,19 @@ class Handler(BaseHTTPRequestHandler):
             recipe=next((x for x in state['recipes'] if x['id']==ident),None)
             if not recipe: raise ValidationError('ТТК не найдена')
             item=items[recipe['item_id']]
-            rows=[['Версия',recipe['version']],['Базовый выход',recipe['yield_qty'],item['unit']]]
+            rows=[['Номер ТТК',f'{recipe["id"]:06}'],['Дата создания',recipe['created']],['Автор',recipe.get('author') or 'Не указан'],['Версия',recipe['version']],['Базовый выход',recipe['yield_qty'],item['unit']]]
             rows += [['Ингредиент','Ед.','Обработка','Брутто','Мех. потери, %','Нетто после мех.','Тепл. потери, %','Выход','Цена, ₽','Стоимость, ₽']]
             total=0
             for l in recipe['lines']:
                 price=items[l['item_id']]['planned_cost']; value=price*l['gross']; total+=value
                 rows.append([l['name'],l['unit'],l['treatment'],round(l['gross'],6),l['mechanical'],round(l['gross']*(1-l['mechanical']/100),6),l['thermal'],l['net'],round(price,2),round(value,2)])
-            rows += [['Итого, ₽',round(total,2)],['Себестоимость единицы, ₽',round(total/recipe['yield_qty'],2)],['Технология',recipe['technology']],['Качество',recipe['quality']],['Хранение',recipe['storage']]]
-            return ('Технологическая карта' if typ=='recipe' else 'Калькуляционная карта')+f' — {item["name"]}, в{recipe["version"]}',rows
+            labor=item['labor_rate']*recipe['yield_qty'];overhead=item['overhead_rate']*recipe['yield_qty']+total*item['overhead_percent']/100
+            if typ=='calculation':
+                rows += [['Сырьё и упаковка, ₽',round(total,2)],['Зарплата, ₽',round(labor,2)],['Прочие производственные, ₽',round(overhead,2)],['Итого, ₽',round(total+labor+overhead,2)],['Себестоимость единицы, ₽',round((total+labor+overhead)/recipe['yield_qty'],2)]]
+            else:
+                rows=[r[:8] if len(r)==10 else r for r in rows]
+            rows += [['Технология',recipe['technology']],['Качество',recipe['quality']],['Хранение',recipe['storage']]]
+            return ('Технологическая карта' if typ=='recipe' else 'Калькуляционная карта')+f' № {recipe["id"]:06} — {item["name"]}, в{recipe["version"]}',rows
         if typ=='order':
             order=next((x for x in state['orders'] if x['id']==ident),None)
             if not order: raise ValidationError('Заказ не найден')
@@ -149,6 +165,41 @@ class Handler(BaseHTTPRequestHandler):
                 rows.append([stop['driver_name']+' · '+stop['driver_phone']+' / '+stop['vehicle'],stop['position'] or n,str(stop['order_id'])+' / '+stop['due'][11:],stop['client'],stop['address'],stop['phone'],stop['contact'],', '.join(map(str,stop['invoice_numbers'])),goods,stop['total'],stop['to_collect'],''])
             rows.append(['Итого','','','','','','','','',round(sum(s['total'] for s in route['stops']),2),round(sum(s['to_collect'] for s in route['stops']),2),''])
             return 'Маршрутный лист — '+route['date'],rows
+        if typ in ('inventory_blank','inventory_empty'):
+            rows=[['Дата ревизии','________________'],['Склад','________________'],['Ответственный','________________'],[],['№','Наименование','Партия','Ед.','Факт','Примечание']]
+            if typ=='inventory_blank':
+                lots=[l for l in state['lots'] if l['qty']>1e-7]
+                rows += [[n,items[l['item_id']]['name'],l['code'],items[l['item_id']]['unit'],'____________','____________'] for n,l in enumerate(lots,1)]
+            else: rows += [[n,'________________','____________','____','____________','____________'] for n in range(1,21)]
+            rows += [[],['Пересчитал','________________ / ________________'],['Проверил','________________ / ________________']]
+            return 'Ведомость для подсчёта остатков',rows
+        if typ=='job':
+            job=next((x for x in state['production_jobs'] if x['id']==ident),None)
+            if not job:raise ValidationError('Наряд не найден')
+            history=json.loads(job['revisions']);revision=int(q.get('revision',[str(len(history)+1)])[0])
+            if not 1<=revision<=len(history)+1:raise ValidationError('Версия наряда не найдена')
+            products=job['products'] if revision==len(history)+1 else history[revision-1]['previous_products']
+            return f'Наряд № {ident:06}',[['Версия наряда',revision],['Дата исполнения',job['date']],['Создан',job['created']],['Ответственный',job['responsible']],['Статус',job['status']],[],['Продукция','План выпуска','Ед.']]+[[p['name'],p['qty'],p['unit']] for p in products]
+        if typ=='fullcost':
+            rows=[['Счёт','Дата','Клиент','Выручка с возвратами, ₽','Производственная стоимость, ₽','Распределённые расходы, ₽','Обмены, ₽','Полная стоимость, ₽','Результат, ₽']]
+            effective=[d for d in state['documents'] if not d['reversed']]
+            for doc in effective:
+                if doc['kind']!='shipment' or not q.get('from',['0001-01-01'])[0]<=doc['date']<=q.get('to',['9999-12-31'])[0]:continue
+                returns=[r for r in effective if r['kind']=='return' and r['data']['shipment_id']==doc['id']]
+                revenue=doc['total']-sum(r['total'] for r in returns);cost=doc['cost']-sum(r['cost'] for r in returns)
+                allocated=sum(a['amount'] for e in effective if e['kind']=='expense' and not e['data'].get('already_in_cost') for a in e['data'].get('allocations',[]) if a['document_id']==doc['id'])
+                exchanges=sum(e['cost'] for e in effective if e['kind']=='exchange' and e['data']['shipment_id']==doc['id'])
+                full=cost+allocated+exchanges
+                rows.append([doc['id'],doc['date'],doc['data']['client_name'],round(revenue,2),round(cost,2),round(allocated,2),round(exchanges,2),round(full,2),round(revenue-full,2)])
+            return 'Полная себестоимость продаж',rows
+        if typ=='payroll':
+            rows=[['Дата','Выпуск №','Сотрудник','Продукция','Выработка','Ед.','Расценка, ₽','Начислено, ₽']]
+            work=self.store.payroll(q.get('from',['0001-01-01'])[0],q.get('to',['9999-12-31'])[0])
+            employee=q.get('employee_id',[''])[0]
+            work=[w for w in work if not employee or w['employee_id']==int(employee)]
+            rows += [[w['date'],w['document_id'],w['name'],w['product'],w['qty'],w['unit'],w['rate'],w['amount']] for w in work]
+            rows += [['Итого начислено, ₽',round(sum(w['amount'] for w in work),2)]]
+            return 'Выработка и начисления сотрудникам',rows
         if typ=='debts': return 'Задолженность',[['Клиент','Накладная','Дата','Срок оплаты','Долг, ₽','Просрочен']]+[[d['client'],d['document_id'],d['date'],d['due'],d['amount'],'К оплате сегодня' if d['pending'] else 'Просрочен' if d['overdue'] else 'Долг'] for d in state['debts']]
         if typ=='analytics':
             start=q.get('from',['0001-01-01'])[0]; end=q.get('to',['9999-12-31'])[0]
@@ -191,7 +242,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(d,dict): raise ValidationError('Ожидается объект JSON')
             with LOCK:
                 if self.path in ('/api/restore','/api/restore-preview'): return self.restore(dict(d,preview=self.path=='/api/restore-preview'))
-                actions={'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
+                actions={'/api/employees':self.store.save_employee,'/api/jobs':self.store.save_job,'/api/exchange':self.store.exchange,'/api/refund':self.store.refund,'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
                     '/api/receipt':self.store.receipt,'/api/production':self.store.production,'/api/orders':self.store.save_order,
                     '/api/close-order':self.store.close_order,'/api/shipment':self.store.shipment,'/api/money':self.store.money,
                     '/api/writeoff':self.store.writeoff,'/api/inventory':self.store.inventory}
@@ -216,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
             with closing(sqlite3.connect(f'file:{temp.as_posix()}?mode=ro',uri=True)) as c:
                 c.execute('PRAGMA trusted_schema=OFF')
                 if c.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise ValidationError('Повреждённая база')
-                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
+                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,2,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
                 for table in ('items','partners','lots','movements','recipes','documents','orders','order_lines'):
                     if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone(): raise ValidationError('Неверная структура базы')
                 if c.execute('PRAGMA foreign_key_check').fetchone(): raise ValidationError('Повреждены связи базы')
@@ -224,6 +275,8 @@ class Handler(BaseHTTPRequestHandler):
                 tables=('items','partners','recipes','lots','orders','documents')
                 source_counts={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in tables}
                 source_counts['drivers']=c.execute('SELECT count(*) FROM drivers').fetchone()[0] if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='drivers'").fetchone() else 0
+                for optional in ('employees','production_jobs'):
+                    source_counts[optional]=c.execute('SELECT count(*) FROM '+optional).fetchone()[0] if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(optional,)).fetchone() else 0
                 source_schema=c.execute('PRAGMA user_version').fetchone()[0]
             if d.get('preview'):
                 return self.send(200,{'counts':source_counts,'schema_version':source_schema,'sha256':digest})
@@ -241,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             os.replace(temp,self.store.path)
             self.server.store=Store(self.store.path)
             with closing(self.store.connect()) as c:
-                counts={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in tables+('drivers',)}
+                counts={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in tables+('drivers','employees','production_jobs')}
             self.send(200,{'ok':True,'counts':counts,'database_path':str(self.store.path.resolve())})
         finally:
             for suffix in ('','-wal','-shm'):

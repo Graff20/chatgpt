@@ -7,7 +7,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from contextlib import contextmanager, closing
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EPS = 1e-7
 
 def money_round(value):
@@ -102,7 +102,9 @@ CREATE INDEX docs_date ON documents(date);
 CREATE INDEX orders_due ON orders(due);
 '''
 
-class Store:
+from workflow import WorkflowMixin
+
+class Store(WorkflowMixin):
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +135,13 @@ class Store:
                     PRAGMA user_version=2;
                     COMMIT;''')
                 version = 2
+            if version == 2:
+                backup = self.path.parent/'backups'/f'before-v3-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3'
+                backup.parent.mkdir(exist_ok=True)
+                with closing(sqlite3.connect(backup)) as target:
+                    c.backup(target)
+                self.migrate_v3(c)
+                version = 3
             if version != SCHEMA_VERSION:
                 raise ValidationError('Версия базы не поддерживается этим приложением')
 
@@ -210,8 +219,10 @@ class Store:
                   number(d.get('minimum', 0), 'Минимум', False), number(d.get('price', 0), 'Цена', False),
                   number(d.get('sale_price', 0), 'Цена продажи', False), shelf_hours,
                   mode, dumps(losses), number(d.get('pack_size', 1), 'Состав упаковки'), str(d.get('notes', '')),
-                  int(bool(d.get('active', True))), int(bool(d.get('track_expiry', True)))]
-        cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active,track_expiry'
+                  int(bool(d.get('active', True))), int(bool(d.get('track_expiry', True)))]+[number(d.get(k,0),k,False) for k in ('labor_rate','overhead_rate','overhead_percent','production_buffer')]
+        if (kind in ('raw','packaging') or mode=='virtual') and any(number(d.get(k,0),k,False)>0 for k in ('labor_rate','overhead_rate','overhead_percent')):
+            raise ValidationError('Расценку и производственные расходы задавайте складскому блюду или полуфабрикату; для сырья и виртуального полуфабриката оставьте нули')
+        cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active,track_expiry,labor_rate,overhead_rate,overhead_percent,production_buffer'
         with self.transaction() as c:
             if d.get('id'):
                 old = self.one(c, 'items', d['id'])
@@ -288,8 +299,8 @@ class Store:
                     visit(line['item_id'], path | {ident})
             visit(product['id'], set())
             v = c.execute('SELECT coalesce(max(version),0)+1 FROM recipes WHERE item_id=?',(product['id'],)).fetchone()[0]
-            return c.execute('INSERT INTO recipes(item_id,version,yield_qty,lines,technology,storage,quality,created) VALUES(?,?,?,?,?,?,?,?)',
-                (product['id'], v, yield_qty, dumps(lines), d.get('technology',''), d.get('storage',''), d.get('quality',''), datetime.now().isoformat())).lastrowid
+            return c.execute('INSERT INTO recipes(item_id,version,yield_qty,lines,technology,storage,quality,created,author) VALUES(?,?,?,?,?,?,?,?,?)',
+                (product['id'], v, yield_qty, dumps(lines), d.get('technology',''), d.get('storage',''), d.get('quality',''), datetime.now().isoformat(), str(d.get('author') or d.get('responsible') or 'Не указан'))).lastrowid
 
     def requirements(self, c, item_id, quantity, path=None):
         path = set() if path is None else path
@@ -318,7 +329,8 @@ class Store:
             recipe = self.latest_recipe(c, item_id)
         except ValidationError:
             return item['price']
-        return sum(x['gross']*self.planned_cost(c,x['item_id'],path|{item_id}) for x in recipe['lines'])/recipe['yield_qty']
+        materials = sum(x['gross']*self.planned_cost(c,x['item_id'],path|{item_id}) for x in recipe['lines'])/recipe['yield_qty']
+        return materials + item['labor_rate'] + item['overhead_rate'] + materials*item['overhead_percent']/100
 
     def doc(self, c, kind, d, total=0, cost=0, data=None):
         dt = day(d.get('date', date.today().isoformat()))
@@ -342,7 +354,7 @@ class Store:
         c.execute('INSERT INTO movements(document_id,lot_id,item_id,qty,unit_cost) VALUES(?,?,?,?,?)', (doc_id,ident,item['id'],qty,price))
         return ident
 
-    def consume(self, c, doc_id, item_id, qty, at, lot_id=None, allow_expired=False):
+    def consume(self, c, doc_id, item_id, qty, at, lot_id=None, allow_expired=False, reserved=None):
         item = self.one(c,'items',item_id)
         lots = c.execute('SELECT * FROM lots WHERE item_id=? AND qty>? '+('AND id=? ' if lot_id else '')+"ORDER BY (expires=''),expires,produced,id",
             (item_id,EPS,lot_id) if lot_id else (item_id,EPS)).fetchall()
@@ -353,9 +365,9 @@ class Store:
             # Never consume stock that arrived after the business date.
             if self.one(c,'documents',lot['document_id'])['date'] > at[:10]:
                 continue
-            take = min(remaining,lot['qty'])
+            take = min(remaining,max(0,lot['qty']-(reserved or {}).get(lot['id'],0)))
             if take <= EPS:
-                break
+                continue
             c.execute('UPDATE lots SET qty=max(0,qty-?) WHERE id=?',(take,lot['id']))
             c.execute('INSERT INTO movements(document_id,lot_id,item_id,qty,unit_cost) VALUES(?,?,?,?,?)',(doc_id,lot['id'],item_id,-take,lot['unit_cost']))
             used.append(dict(lot_id=lot['id'],code=lot['code'],qty=take,unit_cost=lot['unit_cost'],produced=lot['produced'],expires=lot['expires']))
@@ -379,9 +391,9 @@ class Store:
                 q = self.quantity(item,row.get('qty'),row.get('unit'))
                 price = number(row.get('price'),'Цена',False)
                 lot = self.add_lot(c,ident,item,q,price,row.get('produced'),row.get('expires'),row.get('code',''),supplier['id'])
-                lines.append(dict(item_id=item['id'],name=item['name'],qty=q,unit=item['unit'],price=price,lot_id=lot))
+                lines.append(dict(item_id=item['id'],name=item['name'],qty=q,unit=item['unit'],price=price,lot_id=lot,code=self.one(c,'lots',lot)['code'],produced=row.get('produced'),expires=row.get('expires') or ''))
                 total += q*price
-            c.execute('UPDATE documents SET total=?,data=? WHERE id=?',(total,dumps({'lines':lines,'supplier_name':supplier['name']}),ident))
+            c.execute('UPDATE documents SET total=?,data=? WHERE id=?',(total,dumps({'lines':lines,'supplier_name':supplier['name'],'company_name':self.company(c)['name'],'supplier_document':str(d.get('supplier_document','')),'warehouse':str(d.get('warehouse','')),'handed_by':str(d.get('handed_by',''))}),ident))
             return ident
 
     def production(self, d):
@@ -407,8 +419,13 @@ class Store:
                 value, lots = self.consume(c,ident,iid,amount,made)
                 cost += value
                 inputs.append(dict(item_id=iid,name=ingredient['name'],unit=ingredient['unit'],qty=amount,lots=lots))
+            materials_cost = cost
+            workers, labor_cost = self.production_workers(c,item,q,d)
+            overhead_cost = money_round(q*item['overhead_rate']+materials_cost*item['overhead_percent']/100)
+            cost += labor_cost + overhead_cost
+            job = self.production_job(c,item,d)
             lot_id = self.add_lot(c,ident,item,q,cost/q,made,expires,d.get('code',''))
-            data = dict(item_id=item['id'],name=item['name'],qty=q,unit=item['unit'],recipe=recipe,inputs=inputs,lot_id=lot_id)
+            data = dict(item_id=item['id'],name=item['name'],qty=q,unit=item['unit'],recipe=recipe,inputs=inputs,lot_id=lot_id,workers=workers,labor_rate=item['labor_rate'],materials_cost=materials_cost,labor_cost=labor_cost,overhead_cost=overhead_cost,overhead_rate=item['overhead_rate'],overhead_percent=item['overhead_percent'],job_id=job,planned_qty=number(d.get('planned_qty') or q,'Плановый выпуск'),basis=str(d.get('basis') or ('По наряду № '+str(job) if job else 'На свободный склад')),warehouse=str(d.get('warehouse','Основной склад')),produced=made,expires=expires,code=self.one(c,'lots',lot_id)['code'])
             c.execute('UPDATE documents SET cost=?,data=? WHERE id=?',(cost,dumps(data),ident))
             return ident
 
@@ -500,7 +517,11 @@ class Store:
                     raise ValidationError('Строка уже отгружена')
                 if line['shipped']+q > line['qty']*(1+line['tolerance']/100)+EPS:
                     raise ValidationError(f'{item["name"]}: превышен допуск {line["tolerance"]}%')
-                v,lots = self.consume(c,ident,item['id'],q,at)
+                reserved={}
+                for allocation in self.allocate_orders(c,exclude_order=order['id']):
+                    if (allocation['due'],allocation['order_id']) < (order['due'],order['id']):
+                        for lot in allocation['lots']:reserved[lot['lot_id']]=reserved.get(lot['lot_id'],0)+lot['qty']
+                v,lots = self.consume(c,ident,item['id'],q,at,reserved=reserved)
                 cost += v
                 gross_total=money_round(q*line['price'])
                 line_total=money_round(Decimal(str(gross_total))*(1-Decimal(str(discount))/100))
@@ -538,7 +559,7 @@ class Store:
             if r['kind']=='return':
                 invoice=json.loads(r['data'])['shipment_id']
                 if invoice in invoices: invoices[invoice]-=r['total']
-        payments=sum(r['total'] for r in docs if r['kind']=='payment')
+        payments=sum(r['total']*(1 if r['kind']=='payment' else -1) for r in docs if r['kind'] in ('payment','refund'))
         return money_round(max(0,sum(invoices.values())-payments))
 
     def close_day(self,d):
@@ -556,7 +577,7 @@ class Store:
 
     def balance(self,c,client_id):
         reversed_ids=self.reversed_ids(c)
-        return sum(r['total']*(1 if r['kind']=='shipment' else -1) for r in c.execute("SELECT * FROM documents WHERE partner_id=? AND kind IN ('shipment','payment','return')",(client_id,)) if r['id'] not in reversed_ids)
+        return sum(r['total']*(1 if r['kind'] in ('shipment','refund') else -1) for r in c.execute("SELECT * FROM documents WHERE partner_id=? AND kind IN ('shipment','payment','return','refund')",(client_id,)) if r['id'] not in reversed_ids)
 
     def reverse(self,d):
         with self.transaction() as c:
@@ -567,8 +588,19 @@ class Store:
             if day(d.get('date',date.today().isoformat())) < target['date']:
                 raise ValidationError('Отмена не может быть раньше документа')
             data=json.loads(target['data'])
+            if target['kind']=='production':
+                for worker in data.get('workers',[]):
+                    accrued=0;paid=0
+                    for row in c.execute("SELECT id,kind,data,total FROM documents WHERE kind IN ('production','expense')"):
+                        if row['id'] in self.reversed_ids(c) or row['id']==target['id']:continue
+                        payload=json.loads(row['data'])
+                        if row['kind']=='production':accrued+=sum(w['amount'] for w in payload.get('workers',[]) if w['employee_id']==worker['employee_id'])
+                        elif payload.get('employee_id')==worker['employee_id'] and payload.get('already_in_cost'):paid+=row['total']
+                    if paid>accrued+EPS:raise ValidationError('Сначала отмените выплату зарплаты по этому выпуску')
             if target['kind']=='shipment':
-                if any(json.loads(r['data']).get('shipment_id')==target['id'] and r['id'] not in self.reversed_ids(c) for r in c.execute("SELECT id,data FROM documents WHERE kind='return'")):
+                if any(any(a['document_id']==target['id'] for a in json.loads(e['data']).get('allocations',[])) for e in c.execute("SELECT id,data FROM documents WHERE kind='expense'") if e['id'] not in self.reversed_ids(c)):
+                    raise ValidationError('Сначала отмените расходы, распределённые на этот счёт')
+                if any(json.loads(r['data']).get('shipment_id')==target['id'] and r['id'] not in self.reversed_ids(c) for r in c.execute("SELECT id,data FROM documents WHERE kind IN ('return','exchange')")):
                     raise ValidationError('Сначала отмените возвраты по этой отгрузке')
             moves=[dict(r) for r in c.execute('SELECT * FROM movements WHERE document_id=?',(target['id'],))]
             # Newer dependent documents must be reversed first, keeping traceability intact.
@@ -600,13 +632,13 @@ class Store:
             reversed_ids=self.reversed_ids(c)
             previous={}
             previous_values={}
-            for row in c.execute("SELECT id,data FROM documents WHERE kind='return'"):
+            for row in c.execute("SELECT id,data FROM documents WHERE kind IN ('return','exchange')"):
                 if row['id'] in reversed_ids:continue
                 prior=json.loads(row['data'])
                 if prior['shipment_id']==original['id']:
                     for line in prior['lines']:
                         previous[line['line_id']]=previous.get(line['line_id'],0)+line['qty']
-                        previous_values[line['line_id']]=previous_values.get(line['line_id'],0)+line.get('line_total',line['qty']*line['price'])
+                        previous_values[line['line_id']]=previous_values.get(line['line_id'],0)+line.get('original_value',line.get('line_total',line['qty']*line['price']))
             d=dict(d,partner_id=original['partner_id'])
             ident=self.doc(c,'return',d)
             total,cost,rows,seen=0,0,[],set()
@@ -661,7 +693,7 @@ class Store:
                 data = {'client_name':client['name'],'driver_id':driver['id'] if driver else None,'driver_name':driver['name'] if driver else ''}
             else:
                 d = dict(d,partner_id=None)
-                data = {'category':required(d.get('category'),'Статья расхода')}
+                data = self.expense_details(c,d,amount)
             return self.doc(c,kind,d,total=amount,data=data)
 
     def writeoff(self,d):
@@ -707,7 +739,7 @@ class Store:
         with closing(self.connect()) as c:
             c.execute('BEGIN')
             now=datetime.now().isoformat(timespec='minutes')
-            result={t:[dict(r) for r in c.execute('SELECT * FROM '+t+' ORDER BY id')] for t in ('items','partners','recipes','lots','orders','order_lines','documents','drivers')}
+            result={t:[dict(r) for r in c.execute('SELECT * FROM '+t+' ORDER BY id')] for t in ('items','partners','recipes','lots','orders','order_lines','documents','drivers','employees','production_jobs')}
             for r in result['recipes']:
                 r['lines']=json.loads(r['lines'])
             for i in result['items']:
@@ -726,7 +758,7 @@ class Store:
                 p['balance']=self.balance(c,p['id'])
                 p['debt']=self.settled_debt(c,p['id'])
                 p['pending_today']=money_round(max(0,p['balance']-p['debt']))
-                funds=sum(x['total'] for x in result['documents'] if x['partner_id']==p['id'] and x['kind']=='payment' and not x['reversed'])
+                funds=sum(x['total']*(1 if x['kind']=='payment' else -1) for x in result['documents'] if x['partner_id']==p['id'] and x['kind'] in ('payment','refund') and not x['reversed'])
                 overdue=0
                 for doc in sorted((x for x in result['documents'] if x['partner_id']==p['id'] and x['kind']=='shipment' and not x['reversed']),key=lambda x:(x['date'],x['id'])):
                     credits=sum(x['total'] for x in result['documents'] if x['kind']=='return' and not x['reversed'] and json.loads(x['data'])['shipment_id']==doc['id'])
@@ -745,34 +777,15 @@ class Store:
             result['day_closed']=bool(c.execute('SELECT 1 FROM day_closures WHERE date=?',(date.today().isoformat(),)).fetchone())
             for doc in result['documents']:
                 doc['data']=json.loads(doc['data'])
+            for job in result['production_jobs']:
+                job['products']=json.loads(job['products'])
+            result['allocations']=self.allocate_orders(c)
             result['now']=now
             result['schema_version']=SCHEMA_VERSION
             return result
 
     def plan(self,due):
-        due=day(due)
-        with closing(self.connect()) as c:
-            demand=c.execute("SELECT l.item_id,sum(max(0,l.qty-l.shipped)) qty FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE o.status='open' AND substr(o.due,1,10)=? GROUP BY l.item_id",(due,)).fetchall()
-            rows=[]; ingredients={}
-            for line in demand:
-                item=self.one(c,'items',line['item_id'])
-                # Earlier unfulfilled orders consume availability first. Exclude expired-by-target lots.
-                prior=c.execute("SELECT coalesce(sum(max(0,l.qty-l.shipped)),0) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE o.status='open' AND substr(o.due,1,10)<? AND l.item_id=?",(due,item['id'])).fetchone()[0]
-                available=c.execute("SELECT coalesce(sum(qty),0) FROM lots WHERE item_id=? AND (expires='' OR expires>?) AND blocked=0 AND produced<=?",(item['id'],due+'T23:59',datetime.now().isoformat(timespec='minutes'))).fetchone()[0]
-                free=max(0,available-prior); need=max(0,line['qty']-free)
-                error=''
-                if need>EPS:
-                    try:
-                        for iid,q in self.requirements(c,item['id'],need).items(): ingredients[iid]=ingredients.get(iid,0)+q
-                    except ValidationError as e: error=str(e)
-                rows.append(dict(item_id=item['id'],name=item['name'],unit=item['unit'],ordered=line['qty'],available=available,prior_demand=prior,free=free,produce=need,error=error))
-            inputs=[]
-            for iid,q in ingredients.items():
-                item=self.one(c,'items',iid)
-                if item['unit'] in ('шт.','уп.'): q=math.ceil(q-EPS)
-                available=c.execute("SELECT coalesce(sum(qty),0) FROM lots WHERE item_id=? AND (expires='' OR expires>?) AND produced<=? AND blocked=0",(iid,datetime.now().isoformat(timespec='minutes'),datetime.now().isoformat(timespec='minutes'))).fetchone()[0]
-                inputs.append(dict(name=item['name'],unit=item['unit'],qty=q,available=available,shortage=max(0,q-available)))
-            return dict(date=due,products=rows,ingredients=inputs)
+        return self.production_plan(due)
 
     def save_driver(self,d):
         name=required(d.get('name'),'Имя водителя')

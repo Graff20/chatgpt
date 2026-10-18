@@ -35,6 +35,7 @@ with tempfile.TemporaryDirectory() as td:
             page.locator('[name=unit]').select_option('шт.')
             page.get_by_role('button',name='Сохранить',exact=True).click()
             expect(page.locator('#modal')).not_to_be_visible()
+            page.get_by_role('button',name='Раскрыть всё').click()
             expect(page.get_by_text('Тестовая упаковка',exact=True)).to_be_visible()
             # Create recipe version from existing, preserving copied losses.
             page.locator('#nav a[href="#recipes"]').click()
@@ -54,6 +55,7 @@ with tempfile.TemporaryDirectory() as td:
             page.locator('#nav a[href="#orders"]').click()
             page.get_by_role('button',name='＋ Новый заказ').click()
             page.locator('[name=client_id]').select_option(label='Кофейня «Тёплый хлеб»')
+            page.locator('[name=due]').fill(__import__('datetime').datetime.now().isoformat(timespec='minutes'))
             page.locator('#order-lines .r-item').select_option(label='Куриное филе сувид')
             page.locator('#order-lines .r-qty').fill('1')
             expect(page.locator('#order-summary')).to_contain_text('790')
@@ -70,7 +72,7 @@ with tempfile.TemporaryDirectory() as td:
             page.locator('#nav a[href="#documents"]').click()
             page.locator('[data-action="view-document"]').first.click()
             iframe=page.frame_locator('iframe')
-            expect(iframe.locator('h1')).to_contain_text('Товарная накладная')
+            expect(iframe.locator('h1')).to_contain_text('Счёт №')
             expect(iframe.get_by_text('1,037',exact=True)).to_be_visible()
             page.locator('[data-action="close-modal"]').first.click()
             # Return quarantines the goods; release requires a separate decision.

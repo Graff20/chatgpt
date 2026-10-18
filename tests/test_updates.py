@@ -200,7 +200,7 @@ class HttpUpdateTests(unittest.TestCase):
             c.commit()
         self.request('/api/restore',{'file':base64.b64encode(legacy.read_bytes()).decode(),'confirm':'ВОССТАНОВИТЬ'})
         state=json.loads(self.request('/api/state')[1])
-        self.assertEqual(state['schema_version'],2)
+        self.assertEqual(state['schema_version'],SCHEMA_VERSION)
         self.assertEqual(state['items'][0]['name'],'Сахар')
         self.request('/api/drivers',{'name':'Иван'})
         self.assertEqual(len(json.loads(self.request('/api/state')[1])['drivers']),1)
