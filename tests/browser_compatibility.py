@@ -6,7 +6,7 @@ import os
 import json
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from app import Server
+from app import Server,APP_VERSION
 from playwright.sync_api import sync_playwright,expect
 
 with tempfile.TemporaryDirectory() as td:
@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory() as td:
             expect(page.locator('h1')).to_have_text('Производство под контролем')
             page.locator('#nav a[href="#settings"]').click()
             expect(page.locator('#content')).to_contain_text(str(server.store.path))
-            expect(page.locator('#content')).to_contain_text('0.2.2')
+            expect(page.locator('#content')).to_contain_text(APP_VERSION)
             browser.close()
             print('Compatibility check passed: old server detected, no TypeError, writes blocked, actual database path shown after reload.')
     finally:server.shutdown();server.server_close();thread.join()
