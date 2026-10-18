@@ -23,7 +23,7 @@ ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.3.0'
+APP_VERSION='0.3.1'
 
 ASSETS=('index.html','app.js','style.css')
 
@@ -242,7 +242,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(d,dict): raise ValidationError('Ожидается объект JSON')
             with LOCK:
                 if self.path in ('/api/restore','/api/restore-preview'): return self.restore(dict(d,preview=self.path=='/api/restore-preview'))
-                actions={'/api/employees':self.store.save_employee,'/api/jobs':self.store.save_job,'/api/exchange':self.store.exchange,'/api/refund':self.store.refund,'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
+                actions={'/api/delete-document':self.store.delete_document,'/api/delete-order':self.store.delete_order,'/api/dispatch-summary':self.store.dispatch_summary,'/api/recalculate':self.store.recalculate,'/api/production-workers':self.store.update_production_workers,'/api/employees':self.store.save_employee,'/api/jobs':self.store.save_job,'/api/exchange':self.store.exchange,'/api/refund':self.store.refund,'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
                     '/api/receipt':self.store.receipt,'/api/production':self.store.production,'/api/orders':self.store.save_order,
                     '/api/close-order':self.store.close_order,'/api/shipment':self.store.shipment,'/api/money':self.store.money,
                     '/api/writeoff':self.store.writeoff,'/api/inventory':self.store.inventory}

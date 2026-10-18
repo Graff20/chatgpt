@@ -103,8 +103,9 @@ CREATE INDEX orders_due ON orders(due);
 '''
 
 from workflow import WorkflowMixin
+from adjustments import AdjustmentsMixin
 
-class Store(WorkflowMixin):
+class Store(WorkflowMixin, AdjustmentsMixin):
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,6 +145,8 @@ class Store(WorkflowMixin):
                 version = 3
             if version != SCHEMA_VERSION:
                 raise ValidationError('Версия базы не поддерживается этим приложением')
+
+        self.initialise_cost_dependencies()
 
     def connect(self):
         c = sqlite3.connect(self.path, timeout=30)
@@ -232,6 +235,7 @@ class Store(WorkflowMixin):
                     if referenced or in_recipe or c.execute('SELECT 1 FROM recipes WHERE item_id=?', (old['id'],)).fetchone():
                         raise ValidationError('Единицу, вид и режим используемой позиции менять нельзя; создайте новую карточку')
                 c.execute('UPDATE items SET ' + ','.join(k+'=?' for k in cols.split(',')) + ' WHERE id=?', values + [d['id']])
+                self.recalculate_costs(c,{old['id']},str(d.get('modified_by') or 'Изменение карточки'), 'Изменение расценок и производственных норм карточки')
                 return d['id']
             return c.execute(f'INSERT INTO items ({cols}) VALUES ({",".join("?" for _ in values)})', values).lastrowid
 
@@ -581,44 +585,51 @@ class Store(WorkflowMixin):
 
     def reverse(self,d):
         with self.transaction() as c:
-            target=self.one(c,'documents',d.get('document_id'))
-            if target['kind'] in ('reversal','release') or target['id'] in self.reversed_ids(c):
-                raise ValidationError('Документ уже отменён или сам является отменой')
-            reason=required(d.get('reason'),'Причина отмены')
-            if day(d.get('date',date.today().isoformat())) < target['date']:
-                raise ValidationError('Отмена не может быть раньше документа')
-            data=json.loads(target['data'])
-            if target['kind']=='production':
-                for worker in data.get('workers',[]):
-                    accrued=0;paid=0
-                    for row in c.execute("SELECT id,kind,data,total FROM documents WHERE kind IN ('production','expense')"):
-                        if row['id'] in self.reversed_ids(c) or row['id']==target['id']:continue
-                        payload=json.loads(row['data'])
-                        if row['kind']=='production':accrued+=sum(w['amount'] for w in payload.get('workers',[]) if w['employee_id']==worker['employee_id'])
-                        elif payload.get('employee_id')==worker['employee_id'] and payload.get('already_in_cost'):paid+=row['total']
-                    if paid>accrued+EPS:raise ValidationError('Сначала отмените выплату зарплаты по этому выпуску')
-            if target['kind']=='shipment':
-                if any(any(a['document_id']==target['id'] for a in json.loads(e['data']).get('allocations',[])) for e in c.execute("SELECT id,data FROM documents WHERE kind='expense'") if e['id'] not in self.reversed_ids(c)):
-                    raise ValidationError('Сначала отмените расходы, распределённые на этот счёт')
-                if any(json.loads(r['data']).get('shipment_id')==target['id'] and r['id'] not in self.reversed_ids(c) for r in c.execute("SELECT id,data FROM documents WHERE kind IN ('return','exchange')")):
-                    raise ValidationError('Сначала отмените возвраты по этой отгрузке')
-            moves=[dict(r) for r in c.execute('SELECT * FROM movements WHERE document_id=?',(target['id'],))]
-            # Newer dependent documents must be reversed first, keeping traceability intact.
-            for m in moves:
-                if c.execute("SELECT 1 FROM movements WHERE lot_id=? AND id>? AND document_id NOT IN (SELECT id FROM documents WHERE kind='reversal') AND document_id NOT IN (SELECT json_extract(data,'$.target_id') FROM documents WHERE kind='reversal')",(m['lot_id'],m['id'])).fetchone():
-                    raise ValidationError('По партии есть последующие движения. Отмените зависимые документы в обратном порядке')
-                lot=self.one(c,'lots',m['lot_id'])
-                if lot['qty']-m['qty'] < -EPS:
-                    raise ValidationError('Нельзя отменить: продукция партии уже израсходована')
-            ident=self.doc(c,'reversal',d,data={'target_id':target['id'],'target_kind':target['kind'],'reason':reason})
-            for m in reversed(moves):
-                c.execute('UPDATE lots SET qty=max(0,qty-?) WHERE id=?',(m['qty'],m['lot_id']))
-                c.execute('INSERT INTO movements(document_id,lot_id,item_id,qty,unit_cost) VALUES(?,?,?,?,?)',(ident,m['lot_id'],m['item_id'],-m['qty'],m['unit_cost']))
-            if target['kind']=='shipment':
-                for line in data['lines']:
-                    c.execute('UPDATE order_lines SET shipped=max(0,shipped-?) WHERE id=?',(line['qty'],line['line_id']))
-                c.execute("UPDATE orders SET status='open' WHERE id=?",(data['order_id'],))
-            return ident
+            return self.reverse_in_transaction(c,d)
+
+    def reverse_in_transaction(self,c,d):
+        target=self.one(c,'documents',d.get('document_id'))
+        if target['kind']=='reversal' or target['id'] in self.reversed_ids(c):
+            raise ValidationError('Документ уже отменён или сам является отменой')
+        reason=required(d.get('reason'),'Причина отмены')
+        if day(d.get('date',date.today().isoformat())) < target['date']:
+            raise ValidationError('Отмена не может быть раньше документа')
+        data=json.loads(target['data'])
+        if target['kind']=='production':
+            for worker in data.get('workers',[]):
+                accrued=0;paid=0
+                for row in c.execute("SELECT id,kind,data,total FROM documents WHERE kind IN ('production','expense')"):
+                    if row['id'] in self.reversed_ids(c) or row['id']==target['id']:continue
+                    payload=json.loads(row['data'])
+                    if row['kind']=='production':accrued+=sum(w['amount'] for w in payload.get('workers',[]) if w['employee_id']==worker['employee_id'])
+                    elif payload.get('employee_id')==worker['employee_id'] and payload.get('already_in_cost'):paid+=row['total']
+                if paid>accrued+EPS:raise ValidationError('Сначала отмените выплату зарплаты по этому выпуску')
+        if target['kind']=='shipment':
+            if any(any(a['document_id']==target['id'] for a in json.loads(e['data']).get('allocations',[])) for e in c.execute("SELECT id,data FROM documents WHERE kind='expense'") if e['id'] not in self.reversed_ids(c)):
+                raise ValidationError('Сначала отмените расходы, распределённые на этот счёт')
+            if any(json.loads(r['data']).get('shipment_id')==target['id'] and r['id'] not in self.reversed_ids(c) for r in c.execute("SELECT id,data FROM documents WHERE kind IN ('return','exchange')")):
+                raise ValidationError('Сначала отмените возвраты по этой отгрузке')
+        if target['kind']=='release':
+            if c.execute("SELECT 1 FROM movements WHERE lot_id=? AND document_id>? AND document_id NOT IN (SELECT id FROM documents WHERE kind='reversal') AND document_id NOT IN (SELECT json_extract(data,'$.target_id') FROM documents WHERE kind='reversal')",(data['lot_id'],target['id'])).fetchone():
+                raise ValidationError('По допущенной партии есть последующие движения; сначала отмените их')
+        moves=[dict(r) for r in c.execute('SELECT * FROM movements WHERE document_id=?',(target['id'],))]
+        # Newer dependent documents must be reversed first, keeping traceability intact.
+        for m in moves:
+            if c.execute("SELECT 1 FROM movements WHERE lot_id=? AND id>? AND document_id NOT IN (SELECT id FROM documents WHERE kind='reversal') AND document_id NOT IN (SELECT json_extract(data,'$.target_id') FROM documents WHERE kind='reversal')",(m['lot_id'],m['id'])).fetchone():
+                raise ValidationError('По партии есть последующие движения. Отмените зависимые документы в обратном порядке')
+            lot=self.one(c,'lots',m['lot_id'])
+            if lot['qty']-m['qty'] < -EPS:
+                raise ValidationError('Нельзя отменить: продукция партии уже израсходована')
+        ident=self.doc(c,'reversal',d,data={'target_id':target['id'],'target_kind':target['kind'],'reason':reason})
+        for m in reversed(moves):
+            c.execute('UPDATE lots SET qty=max(0,qty-?) WHERE id=?',(m['qty'],m['lot_id']))
+            c.execute('INSERT INTO movements(document_id,lot_id,item_id,qty,unit_cost) VALUES(?,?,?,?,?)',(ident,m['lot_id'],m['item_id'],-m['qty'],m['unit_cost']))
+        if target['kind']=='release':c.execute('UPDATE lots SET blocked=1 WHERE id=?',(data['lot_id'],))
+        if target['kind']=='shipment':
+            for line in data['lines']:
+                c.execute('UPDATE order_lines SET shipped=max(0,shipped-?) WHERE id=?',(line['qty'],line['line_id']))
+            c.execute("UPDATE orders SET status='open' WHERE id=?",(data['order_id'],))
+        return ident
 
     def customer_return(self,d):
         with self.transaction() as c:
@@ -657,7 +668,7 @@ class Store(WorkflowMixin):
                     if take<=EPS:continue
                     lid=self.add_lot(c,ident,it,take,old['unit_cost'],old['produced'],old['expires'],f'В-{ident}-{old["lot_id"]}',preserve_expiry=True)
                     c.execute('UPDATE lots SET blocked=1 WHERE id=?',(lid,))
-                    lots.append(dict(lot_id=lid,qty=take,unit_cost=old['unit_cost'],produced=old['produced'],expires=old['expires']))
+                    lots.append(dict(lot_id=lid,qty=take,unit_cost=old['unit_cost'],produced=old['produced'],expires=old['expires'],source_lot_id=old['lot_id']))
                     remain-=take;cost+=take*old['unit_cost']
                     if remain<=EPS:break
                 remaining_value=money_round(line.get('line_total',line['qty']*line['price'])-previous_values.get(line['line_id'],0))
@@ -813,7 +824,7 @@ class Store(WorkflowMixin):
     def route(self,dt,driver_id=None):
         dt=day(dt)
         state=self.snapshot()
-        orders=[o for o in state['orders'] if o['due'][:10]==dt and o['status']!='closed' and (driver_id is None or (o['driver_id'] or 0)==int(driver_id))]
+        orders=[o for o in state['orders'] if o['due'][:10]==dt and o['status'] not in ('closed','deleted') and (driver_id is None or (o['driver_id'] or 0)==int(driver_id))]
         orders.sort(key=lambda o:(o['driver_id'] or 0,o['route_position'] or 999999,o['due'],o['id']))
         stops=[]
         for o in orders:

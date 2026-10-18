@@ -28,7 +28,7 @@ class WorkflowTests(unittest.TestCase):
         self.store.save_item(dict(id=self.product,name='Филе сувид',kind='finished',unit='кг',shelf_days=14,labor_rate=rate,**extra))
         return self.store.save_employee({'name':'Иванов Сергей'})
 
-    def test_piecework_historical_rates_and_cost(self):
+    def test_piecework_reprices_cost_and_preserves_audit(self):
         a=self.priced_product(overhead_rate=5,overhead_percent=10)
         b=self.store.save_employee({'name':'Петрова Анна'})
         self.receipt();ident=self.produce(qty=2,workers=[{'employee_id':a,'qty':1.2},{'employee_id':b,'qty':.8}])
@@ -39,8 +39,10 @@ class WorkflowTests(unittest.TestCase):
         self.store.save_item(dict(id=self.product,name='Филе сувид',kind='finished',unit='кг',labor_rate=100))
         self.store.save_employee({'id':a,'name':'Изменённое имя'})
         work=self.store.payroll(self.base['date'],self.base['date'])
-        self.assertEqual(work[0]['rate'],40);self.assertEqual(work[0]['name'],'Иванов Сергей')
-        self.assertEqual(sum(w['amount'] for w in work),80)
+        self.assertEqual(work[0]['rate'],100);self.assertEqual(work[0]['name'],'Иванов Сергей')
+        self.assertEqual(sum(w['amount'] for w in work),200)
+        updated=next(d for d in self.state()['documents'] if d['id']==ident)
+        self.assertEqual(updated['data']['cost_history'][-1]['previous_labor_rate'],40)
 
     def test_workers_invalid_distribution_rolls_back(self):
         a=self.priced_product();self.receipt();before=self.state()

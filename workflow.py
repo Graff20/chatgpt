@@ -32,12 +32,12 @@ class WorkflowMixin:
                 return d['id']
             return c.execute('INSERT INTO employees(name,active) VALUES(?,?)',(name,int(bool(d.get('active',True))))).lastrowid
 
-    def production_workers(self,c,item,q,d):
+    def production_workers(self,c,item,q,d,existing_ids=()):
         from domain import ValidationError, money_round, EPS
         workers=[]; seen=set()
         for row in d.get('workers',[]):
             person=self.one(c,'employees',row.get('employee_id'))
-            if not person['active'] or person['id'] in seen:raise ValidationError('Исполнитель в архиве или повторяется')
+            if (not person['active'] and person['id'] not in existing_ids) or person['id'] in seen:raise ValidationError('Исполнитель в архиве или повторяется')
             seen.add(person['id']);qty=self.quantity(item,row.get('qty'))
             workers.append(dict(employee_id=person['id'],name=person['name'],qty=qty,unit=item['unit'],rate=item['labor_rate'],amount=money_round(qty*item['labor_rate'])))
         if workers and abs(sum(w['qty'] for w in workers)-q)>EPS:raise ValidationError('Выработка исполнителей должна совпадать с фактическим выпуском')
@@ -77,7 +77,7 @@ class WorkflowMixin:
         with closing(self.connect()) as c:
             c.execute('BEGIN')
             alloc=self.allocate_orders(c); rows=[];ingredients={}
-            ids=sorted({a['item_id'] for a in alloc if a['due'][:10]==due} | {r[0] for r in c.execute("SELECT DISTINCT l.item_id FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE substr(o.due,1,10)=? AND o.status!='closed'",(due,))})
+            ids=sorted({a['item_id'] for a in alloc if a['due'][:10]==due} | {r[0] for r in c.execute("SELECT DISTINCT l.item_id FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE substr(o.due,1,10)=? AND o.status NOT IN ('closed','deleted')",(due,))})
             for iid in ids:
                 item=self.one(c,'items',iid);lines=[a for a in alloc if a['due'][:10]==due and a['item_id']==iid]
                 ordered=sum(a['remaining'] for a in lines);covered=sum(a['covered'] for a in lines);need=sum(a['shortage'] for a in lines)
@@ -90,7 +90,7 @@ class WorkflowMixin:
                     except ValidationError as e:error=str(e)
                 prior=sum(a['remaining'] for a in alloc if a['due'][:10]<due and a['item_id']==iid)
                 available=c.execute("SELECT coalesce(sum(qty),0) FROM lots WHERE item_id=? AND blocked=0 AND produced<=? AND (expires='' OR expires>?)",(iid,datetime.now().isoformat(timespec='minutes'),due+'T23:59')).fetchone()[0]
-                totals=c.execute("SELECT coalesce(sum(l.qty),0),coalesce(sum(l.shipped),0) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE substr(o.due,1,10)=? AND o.status!='closed' AND l.item_id=?",(due,iid)).fetchone()
+                totals=c.execute("SELECT coalesce(sum(l.qty),0),coalesce(sum(l.shipped),0) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE substr(o.due,1,10)=? AND o.status NOT IN ('closed','deleted') AND l.item_id=?",(due,iid)).fetchone()
                 rows.append(dict(item_id=iid,name=item['name'],unit=item['unit'],ordered=ordered,shipped=totals[1],total_ordered=totals[0],available=available,covered=covered,free=covered,prior_demand=prior,produce=target,shortage=need,buffer=item['production_buffer'],error=error))
             inputs=[];now=datetime.now().isoformat(timespec='minutes')
             for iid,qty in ingredients.items():
@@ -162,7 +162,7 @@ class WorkflowMixin:
                     skipped=min(skip,old['qty']);skip-=skipped;take=min(left,old['qty']-skipped)
                     if take<=EPS:continue
                     lid=self.add_lot(c,ident,item,take,old['unit_cost'],old['produced'],old['expires'],f'ОБ-{ident}-{old["lot_id"]}',preserve_expiry=True)
-                    c.execute('UPDATE lots SET blocked=1 WHERE id=?',(lid,));lots.append(dict(lot_id=lid,qty=take,unit_cost=old['unit_cost']));returned_cost+=take*old['unit_cost'];left-=take
+                    c.execute('UPDATE lots SET blocked=1 WHERE id=?',(lid,));lots.append(dict(lot_id=lid,qty=take,unit_cost=old['unit_cost'],source_lot_id=old['lot_id']));returned_cost+=take*old['unit_cost'];left-=take
                     if left<=EPS:break
                 incoming.append(dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=q,price=0,line_total=0,original_value=money_round(q*line['price']),line_id=line['line_id'],lots=lots))
             at=timestamp(d.get('at',datetime.now().isoformat(timespec='minutes')))

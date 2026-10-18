@@ -61,7 +61,7 @@ def running_server(port=8765):
         return {'server':header,'schema_version':state.get('schema_version'),
                 'runtime':state.get('runtime'),
                 'counts':{t:len(state.get(t,[])) for t in TABLES},
-                'compatible':state.get('schema_version')==3 and isinstance(state.get('drivers'),list)}
+                'compatible':state.get('schema_version')==3 and isinstance(state.get('drivers'),list) and (state.get('runtime') or {}).get('app_version')=='0.3.1'}
     except (OSError,ValueError,TypeError) as e:
         return {'error':str(e)}
 

@@ -6,7 +6,7 @@ import zipfile
 from html import escape
 from xml.sax.saxutils import escape as xml_escape
 
-KINDS={'receipt':'Приёмка сырья','production':'Выпуск продукции','shipment':'Счёт','writeoff':'Акт списания','inventory':'Ревизионная ведомость','payment':'Оплата клиента','expense':'Расход','reversal':'Отмена документа','return':'Возврат клиента','release':'Допуск партии','exchange':'Физобмен','refund':'Возврат денег клиенту'}
+KINDS={'receipt':'Приёмка сырья','production':'Выпуск продукции','shipment':'Счёт','writeoff':'Акт списания','inventory':'Ревизионная ведомость','payment':'Оплата клиента','expense':'Расход','reversal':'Отмена документа','return':'Возврат клиента','release':'Допуск партии','exchange':'Физобмен','refund':'Возврат денег клиенту','dispatch_summary':'Сводная ведомость к отгрузке'}
 
 def document_table(doc):
     data=doc['data']; rows=[]
@@ -30,6 +30,12 @@ def document_table(doc):
         rows=[['Исходная отгрузка',data['shipment_id']],['Причина',data['reason']],['Возвращено','Ед.','Количество']]+[[x['name'],x['unit'],x['qty']] for x in data['lines']]
         rows += [[],['Выдана замена','Ед.','Количество']]+[[x['name'],x['unit'],x['qty']] for x in data['replacements']]
         rows += [['Изменение долга, ₽',0],['Стоимость выданной замены, ₽',round(data['replacement_cost'],2)]]
+    elif doc['kind']=='dispatch_summary':
+        rows=[['Количество','Неотгруженный остаток' if data['mode']=='remaining' else 'Полное количество заказа'],['Заказы',', '.join('№ '+str(o['id']) for o in data['orders'])],[],['№','Наименование','Ед.','План к отгрузке']]
+        rows += [[n,l['name'],l['unit'],l['qty']] for n,l in enumerate(data['lines'],1)]
+        rows += [[],['Расшифровка по заказам'],['Заказ','Покупатель','Дата отгрузки','Товар','Количество','Ед.']]
+        rows += [[o['id'],o['client_name'],o['due'],l['name'],l['qty'],l['unit']] for o in data['orders'] for l in o['lines']]
+        rows += [[],['Подготовил','________________ / ________________'],['Скомплектовал','________________ / ________________']]
     elif doc['kind']=='inventory':
         rows=[['Партия','Наименование','Ед.','Учёт','Факт','Отклонение','Причина']]
         rows += [[x['lot_id'],x['name'],x['unit'],x['expected'],x['actual'],x['difference'],x['reason']] for x in data['lines']]
@@ -43,7 +49,7 @@ def document_table(doc):
     if doc['kind']=='production': rows += [[],['Исполнитель','Выработка','Ед.','Расценка, ₽','Начислено, ₽']]+[[w['name'],w['qty'],w['unit'],w['rate'],w['amount']] for w in data.get('workers',[])]
     if doc['kind']=='return': rows=[['Исходная отгрузка',data['shipment_id']],['Причина возврата',data['reason']]]+rows
     if doc['kind']=='refund': rows=[['Основание',data['reason']]]+rows
-    meta=([['Статус','ОТМЕНЁН']] if doc.get('reversed') else [])+[['Дата',doc['date']],['Ответственный',doc['responsible']]]
+    meta=([['Удалён',data['deleted']['at']]] if data.get('deleted') else [])+([['Статус','ОТМЕНЁН']] if doc.get('reversed') else [])+[['Дата',doc['date']],['Ответственный',doc['responsible']]]
     for key in ('sender_name','sender_address','sender_phone','client_name','delivery_address','delivery_phone','delivery_contact','driver_name','vehicle','supplier_name','due','order_id','override_reason'):
         if data.get(key) or (doc['kind']=='shipment' and key in ('sender_name','client_name','delivery_address','delivery_phone','delivery_contact')): meta.append([{'sender_name':'Кто отгружает','sender_address':'Адрес отправителя','sender_phone':'Телефон отправителя','delivery_address':'Адрес доставки','delivery_phone':'Телефон покупателя','delivery_contact':'Контактное лицо покупателя','driver_name':'Водитель','vehicle':'Автомобиль','supplier_name':'Поставщик','client_name':'Клиент','due':'Оплатить до','order_id':'Заказ','override_reason':'Согласование лимита'}[key],data.get(key) or '—'])
     if doc['note']: meta.append(['Примечание',doc['note']])
@@ -124,7 +130,7 @@ def invoice_html(doc):
     """Print actual saved shipment; never recompute from mutable cards."""
     d=doc['data'];e=lambda v:escape(str(v or '—'))
     cash=lambda x:f'{x:,.2f}'.replace(',',' ').replace('.',',')
-    body=('<p class="cancelled">ОТМЕНЁН</p>' if doc.get('reversed') else '')
+    body=('<p class="cancelled">УДАЛЁН</p>' if d.get('deleted') else '<p class="cancelled">ОТМЕНЁН</p>' if doc.get('reversed') else '')
     body+=f'<p><strong>Поставщик (Кто отгружает):</strong> {e(d.get("sender_name",doc["responsible"]))}<br>Адрес: {e(d.get("sender_address"))}<br>Телефон поставщика: {e(d.get("sender_phone"))}<br><strong>Покупатель:</strong> {e(d["client_name"])}<br><strong>Дата отгрузки:</strong> {e(display(doc["date"]))}<br><strong>Адрес доставки:</strong> {e(d.get("delivery_address"))}<br><strong>Контактное лицо:</strong> {e(d.get("delivery_contact"))}<br><strong>Телефон:</strong> {e(d.get("delivery_phone"))}</p>'
     body+='<table class="invoice-lines"><thead><tr><th>№</th><th>Наименование</th><th>Ед. измерения</th><th>Количество</th><th>Цена, ₽</th><th>Сумма, ₽</th></tr></thead><tbody>'
     for n,l in enumerate(d['lines'],1):
@@ -138,7 +144,8 @@ def invoice_html(doc):
 
 def receipt_html(doc):
     d=doc['data'];e=lambda v:escape(display(v))
-    body=f'<p><strong>Получатель:</strong> {e(d.get("company_name","Моё производство"))}<br><strong>Поставщик:</strong> {e(d["supplier_name"])}<br>Документ поставщика: {e(d.get("supplier_document") or "—")}<br>Склад: {e(d.get("warehouse") or "Основной склад")}<br>Ответственный за приёмку: {e(doc["responsible"])}</p>'
+    body=('<p class="cancelled">УДАЛЁН</p>' if d.get('deleted') else '<p class="cancelled">ОТМЕНЁН</p>' if doc.get('reversed') else '')
+    body+=f'<p><strong>Получатель:</strong> {e(d.get("company_name","Моё производство"))}<br><strong>Поставщик:</strong> {e(d["supplier_name"])}<br>Документ поставщика: {e(d.get("supplier_document") or "—")}<br>Склад: {e(d.get("warehouse") or "Основной склад")}<br>Ответственный за приёмку: {e(doc["responsible"])}</p>'
     body+='<table><thead><tr><th>№</th><th>Наименование</th><th>Ед.</th><th>Количество</th><th>Цена, ₽</th><th>Сумма, ₽</th></tr></thead><tbody>'
     for n,l in enumerate(d['lines'],1):body+='<tr>'+''.join('<td>'+e(v)+'</td>' for v in [n,l['name'],l['unit'],l['qty'],round(l['price'],2),round(l['qty']*l['price'],2)])+'</tr>'
     body+=f'</tbody></table><p style="text-align:right"><strong>Итого: {doc["total"]:,.2f} ₽</strong><br>Без НДС.</p><h2>Сведения о партиях</h2><table><tr><th>Наименование</th><th>Номер партии</th><th>Дата изготовления</th><th>Годен до</th></tr>'
@@ -149,7 +156,7 @@ def receipt_html(doc):
 
 def production_html(doc):
     d=doc['data'];e=lambda v:escape(display(v))
-    body=('<p class="cancelled">ОТМЕНЁН</p>' if doc.get('reversed') else '')
+    body=('<p class="cancelled">УДАЛЁН</p>' if d.get('deleted') else '<p class="cancelled">ОТМЕНЁН</p>' if doc.get('reversed') else '')
     body+=f'<p>Склад: {e(d.get("warehouse") or "Основной склад")}<br>Основание: {e(d.get("basis") or "На свободный склад")}<br>Ответственный: {e(doc["responsible"])}</p>'
     body+='<h2>Готовая продукция</h2><table><tr><th>Наименование</th><th>Ед.</th><th>План</th><th>Фактический выпуск</th></tr><tr>'+''.join('<td>'+e(v)+'</td>' for v in [d['name'],d['unit'],d.get('planned_qty',d['qty']),d['qty']])+'</tr></table>'
     recipe=d['recipe']
