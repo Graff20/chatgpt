@@ -20,6 +20,8 @@ with tempfile.TemporaryDirectory() as td:
         c.execute("INSERT INTO items(name,kind,unit) VALUES('Сахар из копии','raw','кг')")
         c.execute("INSERT INTO partners(kind,name) VALUES('client','Клиент из копии')")
         c.commit()
+    empty=root/'empty-copy.sqlite3'
+    with closing(sqlite3.connect(empty)) as c:c.executescript(SCHEMA+';PRAGMA user_version=1;')
     original_hash=hashlib.sha256(backup.read_bytes()).hexdigest()
     bad=root/'invalid.sqlite3';bad.write_bytes(b'not a SQLite database')
     server=Server(('127.0.0.1',0),root/'working-data')
@@ -75,8 +77,18 @@ with tempfile.TemporaryDirectory() as td:
             assert server.store.snapshot()['partners'][0]['name']=='Клиент из копии'
             assert list((root/'working-data'/'backups').glob('before-restore-*'))
             assert hashlib.sha256(backup.read_bytes()).hexdigest()==original_hash
-            # Cancelling the native chooser must not permanently suspend background refresh.
+            # An empty copy must be rejected without replacing the restored records.
             page.locator('#nav a[href="#settings"]').click()
+            backups_before=set((root/'working-data'/'backups').glob('before-restore-*'))
+            page.locator('#restore-file').set_input_files(empty)
+            page.locator('#restore-confirm').fill('ВОССТАНОВИТЬ')
+            page.get_by_role('button',name='Восстановить базу',exact=True).click()
+            expect(page.locator('#restore-status')).to_contain_text('копия пустая')
+            assert server.store.snapshot()['items'][0]['name']=='Сахар из копии'
+            assert set((root/'working-data'/'backups').glob('before-restore-*'))==backups_before
+            page.locator('#restore-file').set_input_files([])
+            page.locator('#restore-confirm').fill('')
+            # Cancelling the native chooser must not permanently suspend background refresh.
             with page.expect_file_chooser() as fc:page.locator('#restore-file').click()
             page.locator('#restore-file').dispatch_event('cancel')
             assert not page.evaluate('restorePicking')

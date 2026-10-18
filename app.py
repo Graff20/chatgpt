@@ -1,11 +1,13 @@
 """Local HTTP application, Windows/Linux. Start: python app.py --open."""
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sqlite3
 import threading
 import traceback
+import tempfile
 import sys
 import webbrowser
 from html import escape
@@ -21,7 +23,7 @@ ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.2.3'
+APP_VERSION='0.2.4'
 
 ASSETS=('index.html','app.js','style.css')
 
@@ -188,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
             d=json.loads(self.rfile.read(size))
             if not isinstance(d,dict): raise ValidationError('Ожидается объект JSON')
             with LOCK:
-                if self.path=='/api/restore': return self.restore(d)
+                if self.path in ('/api/restore','/api/restore-preview'): return self.restore(dict(d,preview=self.path=='/api/restore-preview'))
                 actions={'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
                     '/api/receipt':self.store.receipt,'/api/production':self.store.production,'/api/orders':self.store.save_order,
                     '/api/close-order':self.store.close_order,'/api/shipment':self.store.shipment,'/api/money':self.store.money,
@@ -202,12 +204,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             traceback.print_exc(); self.send(500,{'error':'Ошибка сервера. Операция не выполнена; проверьте окно запуска.'})
     def restore(self,d):
-        if d.get('confirm')!='ВОССТАНОВИТЬ': raise ValidationError('Введите ВОССТАНОВИТЬ для подтверждения')
+        if not d.get('preview') and d.get('confirm')!='ВОССТАНОВИТЬ': raise ValidationError('Введите ВОССТАНОВИТЬ для подтверждения')
         raw=base64.b64decode(d.get('file',''),validate=True)
         if not raw.startswith(b'SQLite format 3\x00'): raise ValidationError('Это не резервная копия SQLite')
-        temp=self.server.data/'restore-candidate.sqlite3'
-        if temp.exists(): temp.unlink()
-        temp.write_bytes(raw)
+        digest=hashlib.sha256(raw).hexdigest()
+        if d.get('expected_sha256') and d['expected_sha256']!=digest: raise ValidationError('Файл отличается от проверенной копии. Выберите его заново')
+        fd,staged=tempfile.mkstemp(prefix='restore-candidate-',suffix='.sqlite3',dir=self.server.data)
+        temp=Path(staged)
+        with os.fdopen(fd,'wb') as stream: stream.write(raw)
         try:
             with closing(sqlite3.connect(f'file:{temp.as_posix()}?mode=ro',uri=True)) as c:
                 c.execute('PRAGMA trusted_schema=OFF')
@@ -217,6 +221,14 @@ class Handler(BaseHTTPRequestHandler):
                     if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone(): raise ValidationError('Неверная структура базы')
                 if c.execute('PRAGMA foreign_key_check').fetchone(): raise ValidationError('Повреждены связи базы')
                 if c.execute("SELECT 1 FROM sqlite_master WHERE type IN ('trigger','view')").fetchone(): raise ValidationError('Копия содержит неподдерживаемые объекты')
+                tables=('items','partners','recipes','lots','orders','documents')
+                source_counts={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in tables}
+                source_counts['drivers']=c.execute('SELECT count(*) FROM drivers').fetchone()[0] if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='drivers'").fetchone() else 0
+                source_schema=c.execute('PRAGMA user_version').fetchone()[0]
+            if d.get('preview'):
+                return self.send(200,{'counts':source_counts,'schema_version':source_schema,'sha256':digest})
+            if d.get('require_nonempty') and not any(source_counts.values()):
+                raise ValidationError('Выбранная копия пустая: в ней нет карточек и документов. Рабочая база не заменена. Выберите прежнюю копию с записями')
             candidate=Store(temp)
             candidate.snapshot()  # Validate required columns and JSON before touching live data.
             with closing(candidate.connect()) as c:
@@ -228,9 +240,12 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('PRAGMA journal_mode=DELETE')
             os.replace(temp,self.store.path)
             self.server.store=Store(self.store.path)
-            self.send(200,{'ok':True})
+            with closing(self.store.connect()) as c:
+                counts={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in tables+('drivers',)}
+            self.send(200,{'ok':True,'counts':counts,'database_path':str(self.store.path.resolve())})
         finally:
-            temp.unlink(missing_ok=True)
+            for suffix in ('','-wal','-shm'):
+                Path(str(temp)+suffix).unlink(missing_ok=True)
 
 class Server(ThreadingHTTPServer):
     daemon_threads=True
