@@ -27,6 +27,21 @@ class UpdateTests(unittest.TestCase):
     state=accounting.AccountingTests.state
     order=accounting.AccountingTests.order
     shipment=accounting.AccountingTests.shipment
+    def test_shelf_days_production_and_existing_lots_preserved(self):
+        self.receipt()
+        self.produce()
+        old_lots=self.state()['lots']
+        self.store.save_item({'id':self.product,'name':'Филе сувид','kind':'finished','unit':'кг',
+                              'track_expiry':True,'shelf_days':14})
+        self.assertEqual(old_lots,self.state()['lots'])
+        self.produce()
+        lots=[l for l in self.state()['lots'] if l['item_id']==self.product]
+        newest=max(lots,key=lambda l:l['id'])
+        self.assertEqual(datetime.fromisoformat(newest['expires'])-datetime.fromisoformat(newest['produced']),timedelta(days=14))
+        self.store.save_item({'id':self.product,'name':'Филе сувид','kind':'finished','unit':'кг',
+                              'track_expiry':True,'shelf_days':1.5})
+        self.assertEqual(next(i for i in self.state()['items'] if i['id']==self.product)['shelf_hours'],36)
+
     def test_unlimited_expiry_receipt_consumption_and_plan(self):
         self.store.save_item({'id':self.raw,'name':'Филе','kind':'raw','unit':'кг','track_expiry':False})
         self.store.receipt(dict(self.base,partner_id=self.supplier,lines=[{'item_id':self.raw,'qty':10,'price':100,'produced':self.made}]))

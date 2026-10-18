@@ -201,9 +201,14 @@ class Store:
                 loss[k] = number(loss.get(k, 0), 'Потери', False)
                 if loss[k] >= 100:
                     raise ValidationError('Потери должны быть меньше 100%')
+        shelf_hours = 0
+        if d.get('track_expiry', True):
+            shelf_hours = (number(d['shelf_days'], 'Срок годности, суток') * 24
+                           if 'shelf_days' in d else number(d.get('shelf_hours') or 24, 'Срок годности'))
+            shelf_hours = number(shelf_hours, 'Срок годности')
         values = [name, kind, str(d.get('folder', '')), str(d.get('category', '')), unit,
                   number(d.get('minimum', 0), 'Минимум', False), number(d.get('price', 0), 'Цена', False),
-                  number(d.get('sale_price', 0), 'Цена продажи', False), number(d.get('shelf_hours') or 24, 'Срок годности') if d.get('track_expiry', True) else 0,
+                  number(d.get('sale_price', 0), 'Цена продажи', False), shelf_hours,
                   mode, dumps(losses), number(d.get('pack_size', 1), 'Состав упаковки'), str(d.get('notes', '')),
                   int(bool(d.get('active', True))), int(bool(d.get('track_expiry', True)))]
         cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active,track_expiry'
