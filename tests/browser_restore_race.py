@@ -13,7 +13,9 @@ with tempfile.TemporaryDirectory() as td:
  try:
   with sync_playwright() as p:
    browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox']);page=browser.new_page(viewport={'width':1400,'height':1000});page.goto(f'http://127.0.0.1:{server.server_port}/#settings');expect(page.locator('#restore-file')).to_be_visible()
-   page.evaluate('''() => { window.oldState=JSON.stringify(S);window.realFetch=window.fetch;window.delayedOnce=false;window.fetch=(...a)=>{if(String(a[0]).endsWith('/api/state')&&!window.delayedOnce){window.delayedOnce=true;return new Promise(resolve=>window.releaseOld=()=>resolve(new Response(window.oldState,{status:200,headers:{'Content-Type':'application/json'}})));}return window.realFetch(...a);};window.oldRequest=refreshWhenIdle(); }''')
+   page.evaluate('''() => { window.oldState=JSON.stringify(S);window.realFetch=window.fetch;window.delayedOnce=false;window.fetch=(...a)=>{if(String(a[0]).endsWith('/api/state')&&!window.delayedOnce){window.delayedOnce=true;return new Promise(resolve=>window.releaseOld=()=>resolve(new Response(window.oldState,{status:200,headers:{'Content-Type':'application/json'}})));}return window.realFetch(...a);};window.oldRequest=refresh(); }''')
+   # Start an actual in-flight refresh deterministically; idle refresh may skip while the window lacks focus.
+   page.wait_for_function('window.delayedOnce===true')
    page.locator('#restore-file').set_input_files(backup);page.locator('#restore-confirm').fill('ВОССТАНОВИТЬ');page.get_by_role('button',name='Восстановить базу',exact=True).click();expect(page.locator('#toast')).to_contain_text('База восстановлена')
    print('After restore: UI=',page.evaluate('S.items.length'),'database=',len(server.store.snapshot()['items']))
    page.evaluate('window.releaseOld();window.oldRequest')

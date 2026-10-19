@@ -7,7 +7,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from contextlib import contextmanager, closing
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 EPS = 1e-7
 
 def money_round(value):
@@ -112,8 +112,9 @@ CREATE INDEX orders_due ON orders(due);
 
 from workflow import WorkflowMixin
 from adjustments import AdjustmentsMixin
+from pricing import PricingMixin
 
-class Store(WorkflowMixin, AdjustmentsMixin):
+class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +164,20 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                     ALTER TABLE order_lines ADD COLUMN portion_weight REAL NOT NULL DEFAULT 0;
                     PRAGMA user_version=4; COMMIT;""")
                 version=4
+            if version == 4:
+                backup=self.path.parent/'backups'/f'before-v5-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3'
+                backup.parent.mkdir(exist_ok=True)
+                with closing(sqlite3.connect(backup)) as target:c.backup(target)
+                c.executescript("""BEGIN IMMEDIATE;
+                    CREATE TABLE price_lists(id INTEGER PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,source_id INTEGER REFERENCES price_lists(id),adjustment_type TEXT NOT NULL DEFAULT 'percent',adjustment REAL NOT NULL DEFAULT 0,round_step REAL NOT NULL DEFAULT 0.01,round_mode TEXT NOT NULL DEFAULT 'nearest');
+                    INSERT INTO price_lists(id,name) VALUES(1,'Розница');
+                    CREATE TABLE price_values(list_id INTEGER NOT NULL REFERENCES price_lists(id),item_id INTEGER NOT NULL REFERENCES items(id),mode TEXT NOT NULL,amount REAL,PRIMARY KEY(list_id,item_id));
+                    CREATE TABLE price_history(id INTEGER PRIMARY KEY,created TEXT NOT NULL,responsible TEXT NOT NULL,changes TEXT NOT NULL);
+                    ALTER TABLE partners ADD COLUMN price_list_id INTEGER NOT NULL DEFAULT 1;
+                    ALTER TABLE orders ADD COLUMN price_list_id INTEGER NOT NULL DEFAULT 1;
+                    ALTER TABLE order_lines ADD COLUMN price_origin TEXT NOT NULL DEFAULT 'saved';
+                    PRAGMA user_version=5; COMMIT;""")
+                version=5
             if version != SCHEMA_VERSION:
                 raise ValidationError('Версия базы не поддерживается этим приложением')
 
@@ -274,6 +289,9 @@ class Store(WorkflowMixin, AdjustmentsMixin):
             raise ValidationError('Отсрочка: целое число дней от 0 до 3650')
         values += [int(payment_days), number(d.get('debt_limit', 0), 'Лимит', False), str(d.get('notes', ''))]
         with self.transaction() as c:
+            lid=int(d.get('price_list_id') or (self.one(c,'partners',d['id'])['price_list_id'] if d.get('id') else 1))
+            self.one(c,'price_lists',lid)
+            fields.append('price_list_id');values.append(lid)
             if d.get('id'):
                 old = self.one(c, 'partners', d['id'])
                 if old['kind'] != kind:
@@ -460,15 +478,19 @@ class Store(WorkflowMixin, AdjustmentsMixin):
             manager = required(d.get('manager'),'Менеджер')
             if not d.get('lines'):
                 raise ValidationError('Добавьте товары')
+            saved_lines=[]
+            prices=self.pricing_state(c);quotes={(r['list_id'],r['item_id']):r for r in prices['cells']}
             if d.get('id'):
                 old = self.one(c,'orders',d['id'])
                 if old['status'] != 'open' or c.execute('SELECT 1 FROM order_lines WHERE order_id=? AND shipped>?',(old['id'],EPS)).fetchone():
                     raise ValidationError('Заказ после отгрузки или закрытия редактировать нельзя')
                 ident = old['id']
                 c.execute('UPDATE orders SET client_id=?,due=?,manager=?,note=? WHERE id=?',(client['id'],due,manager,d.get('note',''),ident))
+                saved_lines=[dict(r) for r in c.execute('SELECT * FROM order_lines WHERE order_id=?',(ident,))]
                 c.execute('DELETE FROM order_lines WHERE order_id=?',(ident,))
             else:
                 ident = c.execute('INSERT INTO orders(client_id,due,manager,note,created) VALUES(?,?,?,?,?)',(client['id'],due,manager,d.get('note',''),datetime.now().isoformat())).lastrowid
+            c.execute('UPDATE orders SET price_list_id=? WHERE id=?',(client['price_list_id'],ident))
             seen = set()
             for line in d['lines']:
                 item = self.one(c,'items',line.get('item_id'))
@@ -490,7 +512,21 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                 tolerance = number(line.get('tolerance',10),'Допуск',False)
                 if tolerance > 100:
                     raise ValidationError('Допуск от 0 до 100%')
-                c.execute('INSERT INTO order_lines(order_id,item_id,qty,price,tolerance,order_mode,portions,portion_weight) VALUES(?,?,?,?,?,?,?,?)',(ident,item['id'],qty,number(line.get('price',item['sale_price']),'Цена',False),tolerance,mode,portions,portion_weight))
+                price_mode=line.get('price_mode','manual' if 'price' in line else 'auto')
+                if price_mode not in ('auto','manual','saved'):raise ValidationError('Неверный режим цены заказа')
+                quote=quotes.get((client['price_list_id'],item['id']),dict(price=None,mode='manual',reason='Нет цены'))
+                if price_mode=='auto':
+                    if d.get('price_token') and d['price_token']!=prices['token']:raise ValidationError('Прайс изменился. Откройте заказ заново для актуальных цен')
+                    if quote['price'] is None:raise ValidationError(item['name']+': '+quote['reason'])
+                    price=quote['price']
+                    if 'price' in line and number(line['price'],'Цена',False)!=price:raise ValidationError('Цена прайса изменилась. Обновите цены заказа')
+                else:
+                    if price_mode=='saved':
+                        previous=next((r for r in saved_lines if r['item_id']==item['id']),None)
+                        if not previous or old['client_id']!=client['id'] or number(line.get('price'),'Цена',False)!=previous['price']:raise ValidationError('Сохранённая цена не совпадает с исходным заказом')
+                    elif quote['mode']=='blocked' or 'Не продаётся' in quote['reason']:raise ValidationError(item['name']+': не продаётся по прайсу клиента')
+                    price=number(line.get('price'),'Цена',False)
+                c.execute('INSERT INTO order_lines(order_id,item_id,qty,price,tolerance,order_mode,portions,portion_weight,price_origin) VALUES(?,?,?,?,?,?,?,?,?)',(ident,item['id'],qty,price,tolerance,mode,portions,portion_weight,price_mode))
             self.order_delivery(c,ident,d,client)
             return ident
 
@@ -785,6 +821,7 @@ class Store(WorkflowMixin, AdjustmentsMixin):
             c.execute('BEGIN')
             now=datetime.now().isoformat(timespec='minutes')
             result={t:[dict(r) for r in c.execute('SELECT * FROM '+t+' ORDER BY id')] for t in ('items','partners','recipes','lots','orders','order_lines','documents','drivers','employees','production_jobs')}
+            result['pricing']=self.pricing_state(c)
             for r in result['recipes']:
                 r['lines']=json.loads(r['lines'])
             for i in result['items']:

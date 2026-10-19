@@ -23,9 +23,9 @@ ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.4.0'
+APP_VERSION='0.5.0'
 
-ASSETS=('index.html','app.js','style.css')
+ASSETS=('index.html','app.js','pricing.js','style.css')
 
 def check_assets():
     missing=[]
@@ -45,7 +45,7 @@ def recovery_page(filename):
 <p><a href="/api/backup">Скачать резервную копию текущей базы</a></p><ol>
 <li>Остановите все окна запуска «Цех» сочетанием Ctrl+C.</li>
 <li>Сохраните всю папку <code>data</code> отдельно.</li>
-<li>Распакуйте полный архив программы. Рядом с <code>app.py</code> должна быть папка <code>static</code> с файлами <code>index.html</code>, <code>app.js</code>, <code>style.css</code>.</li>
+<li>Распакуйте полный архив программы. Рядом с <code>app.py</code> должна быть папка <code>static</code> с файлами <code>index.html</code>, <code>app.js</code>, <code>pricing.js</code>, <code>style.css</code>.</li>
 <li>Перенесите вашу сохранённую папку <code>data</code> в папку программы. Не заменяйте её пустой базой.</li>
 <li>Запустите один экземпляр <code>start.bat</code>, затем обновите страницу.</li></ol>
 <p>Если ошибка повторится, передайте последние строки ошибки из окна запуска. Не удаляйте <code>data</code>.</p></main></html>''').encode('utf-8')
@@ -82,6 +82,7 @@ class Handler(BaseHTTPRequestHandler):
             state=self.store.snapshot()
             state['runtime']=self.server.runtime_info()
             return self.send(200,state)
+        if path=='/api/pricing':return self.send(200,self.store.pricing())
         if path=='/api/route': return self.send(200,self.store.route(q.get('date',[date.today().isoformat()])[0],q.get('driver_id',[None])[0]))
         if path=='/api/financial': return self.send(200,self.store.financial_report(q.get('from',[date.today().replace(day=1).isoformat()])[0],q.get('to',[date.today().isoformat()])[0]))
         if path=='/api/plan': return self.send(200,self.store.plan(q.get('date',[date.today().isoformat()])[0]))
@@ -109,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200,invoice_html(doc),'text/html; charset=utf-8')
             content,mime=export(title,rows,fmt)
             return self.send(200,content,mime,None if fmt=='html' else 'ceh-export.'+fmt)
-        files={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}
+        files={'/':'index.html','/app.js':'app.js','/pricing.js':'pricing.js','/style.css':'style.css'}
         if path not in files: return self.send(404,{'error':'Не найдено'})
         p=ROOT/'static'/files[path]
         mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8'}[p.suffix]
@@ -123,6 +124,12 @@ class Handler(BaseHTTPRequestHandler):
     def export_rows(self,state,typ,q):
         items={i['id']:i for i in state['items']}
         ident=int(q.get('id',['0'])[0])
+        if typ=='prices':
+            pricing=state['pricing'];cols=pricing['lists'];cells={(r['list_id'],r['item_id']):r for r in pricing['cells']}
+            rows=[['№','Папка','Категория','Наименование','Ед.']+[r['name'] for r in cols]]
+            products=sorted((i for i in state['items'] if i['kind']=='finished' and i['mode']=='stock' and i['active']),key=lambda i:(i['folder'].casefold(),i['category'].casefold(),i['name'].casefold()))
+            for n,i in enumerate(products,1):rows.append([n,i['folder'],i['category'],i['name'],i['unit']]+[cells[(r['id'],i['id'])]['price'] if cells[(r['id'],i['id'])]['price'] is not None else cells[(r['id'],i['id'])]['reason'] for r in cols])
+            return 'Прайс-лист — готовая продукция',rows
         if typ=='document':
             doc=next((x for x in state['documents'] if x['id']==ident),None)
             if not doc: raise ValidationError('Документ не найден')
@@ -262,6 +269,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(d,dict): raise ValidationError('Ожидается объект JSON')
             with LOCK:
                 if self.path in ('/api/restore','/api/restore-preview'): return self.restore(dict(d,preview=self.path=='/api/restore-preview'))
+                if self.path=='/api/prices':return self.send(200,self.store.edit_prices(d))
                 actions={'/api/delete-document':self.store.delete_document,'/api/delete-order':self.store.delete_order,'/api/dispatch-summary':self.store.dispatch_summary,'/api/recalculate':self.store.recalculate,'/api/production-workers':self.store.update_production_workers,'/api/employees':self.store.save_employee,'/api/jobs':self.store.save_job,'/api/exchange':self.store.exchange,'/api/refund':self.store.refund,'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
                     '/api/receipt':self.store.receipt,'/api/production':self.store.production,'/api/orders':self.store.save_order,
                     '/api/close-order':self.store.close_order,'/api/shipment':self.store.shipment,'/api/money':self.store.money,
@@ -287,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
             with closing(sqlite3.connect(f'file:{temp.as_posix()}?mode=ro',uri=True)) as c:
                 c.execute('PRAGMA trusted_schema=OFF')
                 if c.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise ValidationError('Повреждённая база')
-                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,2,3,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
+                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,2,3,4,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
                 for table in ('items','partners','lots','movements','recipes','documents','orders','order_lines'):
                     if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone(): raise ValidationError('Неверная структура базы')
                 if c.execute('PRAGMA foreign_key_check').fetchone(): raise ValidationError('Повреждены связи базы')

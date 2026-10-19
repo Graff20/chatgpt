@@ -79,6 +79,10 @@ class PortionFinanceTests(unittest.TestCase):
         self.receipt();self.produce();oid=self.store.save_order({'client_id':self.client,'manager':'М','due':self.future,'lines':[{'item_id':self.product,'qty':2,'price':800}]})
         before=self.state()
         with self.store.transaction() as c:
+            c.execute('ALTER TABLE partners DROP COLUMN price_list_id')
+            c.execute('ALTER TABLE orders DROP COLUMN price_list_id')
+            c.execute('ALTER TABLE order_lines DROP COLUMN price_origin')
+            c.execute('DROP TABLE price_values');c.execute('DROP TABLE price_history');c.execute('DROP TABLE price_lists')
             c.execute('ALTER TABLE items DROP COLUMN portion_weight')
             for col in ('order_mode','portions','shipped_portions','portion_weight'):c.execute('ALTER TABLE order_lines DROP COLUMN '+col)
             c.execute('PRAGMA user_version=3')
@@ -142,6 +146,10 @@ class LegacyPortionRestoreTests(unittest.TestCase):
         from demo import create_demo
         store=create_demo(Path(self.tmp.name)/'old.sqlite3');before=store.snapshot()
         with store.transaction() as c:
+            c.execute('ALTER TABLE partners DROP COLUMN price_list_id')
+            c.execute('ALTER TABLE orders DROP COLUMN price_list_id')
+            c.execute('ALTER TABLE order_lines DROP COLUMN price_origin')
+            c.execute('DROP TABLE price_values');c.execute('DROP TABLE price_history');c.execute('DROP TABLE price_lists')
             c.execute('ALTER TABLE items DROP COLUMN portion_weight')
             for col in ('order_mode','portions','shipped_portions','portion_weight'):c.execute('ALTER TABLE order_lines DROP COLUMN '+col)
             c.execute('PRAGMA user_version=3')
@@ -149,7 +157,7 @@ class LegacyPortionRestoreTests(unittest.TestCase):
         source=store.path.read_bytes();digest=hashlib.sha256(source).hexdigest();encoded=base64.b64encode(source).decode()
         preview=json.loads(self.request('/api/restore-preview',{'file':encoded})[1]);self.assertEqual(preview['schema_version'],3)
         self.request('/api/restore',{'file':encoded,'expected_sha256':preview['sha256'],'confirm':'ВОССТАНОВИТЬ'})
-        state=json.loads(self.request('/api/state')[1]);self.assertEqual(state['schema_version'],4)
+        state=json.loads(self.request('/api/state')[1]);self.assertEqual(state['schema_version'],SCHEMA_VERSION)
         for key in ('documents','lots','orders'):self.assertEqual(state[key],before[key])
         self.assertTrue(all(l['order_mode']=='quantity' and l['portions']==0 for l in state['order_lines']))
         self.assertEqual(hashlib.sha256(store.path.read_bytes()).hexdigest(),digest)

@@ -166,11 +166,16 @@ class WorkflowTests(unittest.TestCase):
     def test_v2_upgrade_preserves_lots_orders_docs_and_backup(self):
         self.receipt();self.produce();self.order();before=self.state();path=self.store.path
         with closing(self.store.connect()) as c:
+            c.execute('ALTER TABLE partners DROP COLUMN price_list_id')
+            c.execute('ALTER TABLE orders DROP COLUMN price_list_id')
+            c.execute('ALTER TABLE order_lines DROP COLUMN price_origin')
+            c.execute('DROP TABLE price_values');c.execute('DROP TABLE price_history');c.execute('DROP TABLE price_lists')
             c.execute('DROP TABLE employees');c.execute('DROP TABLE production_jobs')
             for col in ('labor_rate','overhead_rate','overhead_percent','production_buffer','portion_weight'):c.execute('ALTER TABLE items DROP COLUMN '+col)
             for col in ('order_mode','portions','shipped_portions','portion_weight'):c.execute('ALTER TABLE order_lines DROP COLUMN '+col)
             c.execute('ALTER TABLE recipes DROP COLUMN author');c.execute('PRAGMA user_version=2');c.commit()
         upgraded=Store(path);after=upgraded.snapshot()
+        for line in before['order_lines']:line['price_origin']='saved'
         for key in ('lots','documents','orders','order_lines'):self.assertEqual(before[key],after[key])
         backups=list((path.parent/'backups').glob('before-v3-*'));self.assertTrue(backups)
         self.assertTrue(any(sqlite3.connect(b).execute('PRAGMA user_version').fetchone()[0]==2 for b in backups))
