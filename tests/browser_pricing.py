@@ -8,6 +8,7 @@ from playwright.sync_api import sync_playwright,expect
 
 with tempfile.TemporaryDirectory() as td:
  store=create_demo(Path(td)/'ceh.sqlite3');state=store.snapshot();product=next(i for i in state['items'] if i['name']=='Куриное филе сувид');client=next(p for p in state['partners'] if p['kind']=='client');raw=next(i for i in state['items'] if i['kind']=='raw')
+ store.save_company(dict(name='ООО Кухня',address='Москва',phone='+7 900 123-45-67'))
  store.save_item(dict(product,sale_price=947,folder='Кулинария/Сувид',category='Курица'))
  server=Server(('127.0.0.1',0),td);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
  try:
@@ -32,5 +33,7 @@ with tempfile.TemporaryDirectory() as td:
    store.edit_prices(dict(token=store.pricing()['token'],list_id=1,changes=[dict(item_id=product['id'],mode='manual',amount=1200)],apply=True,responsible='М'));page.evaluate('refresh()');page.locator(f'[data-action="view-order"][data-id="{oid}"]').click();page.get_by_role('button',name='Изменить заказ',exact=True).click();expect(page.locator('.r-price')).to_have_value('850');page.get_by_role('button',name='Обновить цены по прайсу').click();expect(page.locator('#order-price-preview')).to_contain_text('1 020,00');expect(page.locator('.r-price')).to_have_value('850');page.get_by_role('button',name='Применить цены к этому заказу').click();expect(page.locator('.r-price')).to_have_value('1020');page.get_by_role('button',name='Сохранить',exact=True).click();expect(page.locator('#modal')).not_to_be_visible();assert next(l for l in store.snapshot()['order_lines'] if l['order_id']==oid)['price']==1020
    assert not errors,errors
    page.locator('#nav a[href="#prices"]').click();page.screenshot(path='/tmp/ceh-prices-050.png',full_page=True)
+   with page.expect_popup() as popup:page.locator('a[href*="type=prices"][href*="format=html"]').click()
+   printed=popup.value;expect(printed.locator('h1')).to_have_text('Прайс-лист');expect(printed.locator('.price-meta')).to_contain_text('ООО Кухня');expect(printed.locator('.price-section')).to_have_count(4);expect(printed.locator('.price-list')).to_contain_text('1 020,00');printed.screenshot(path='/tmp/ceh-price-print-051.png',full_page=True);printed.close()
    browser.close();print('Browser pricing passed: structured finished catalogue, collapse/expand, formula preview, rounding, manual exception/reset, new items, bulk selection, XLSX, client price, preserved order and explicit repricing.')
  finally:server.shutdown();server.server_close();thread.join()

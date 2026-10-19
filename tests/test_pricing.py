@@ -56,7 +56,7 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(self.quote(lid,i)['price'],170)
         h=object.__new__(Handler);h.server=type('Server',(),{'store':self.store})()
         title,rows=h.export_rows(self.state(),'prices',{})
-        row=next(r for r in rows if 'Десерт новый' in r);self.assertEqual(row[1:4],['Кондитерская/Десерты','Муссы','Десерт новый'])
+        row=next(r for r in rows if 'Десерт новый' in r);self.assertEqual(row[1:3],['Десерт новый','уп.']);self.assertIn(['Папка: Кондитерская/Десерты'],rows);self.assertIn(['Категория: Муссы'],rows)
         self.assertFalse(any('Филе' in r for r in rows)) # raw ingredient excluded
     def test_bulk_skips_exceptions_and_only_selected_products(self):
         lid=self.column();other=self.item('Другое','finished',sale_price=100)
@@ -119,6 +119,33 @@ class PricingHttpTests(unittest.TestCase):
         self.request('/api/restore',dict(file=base64.b64encode(backup).decode(),confirm='ВОССТАНОВИТЬ'))
         self.assertEqual(json.loads(self.request('/api/pricing')[1]),original)
         self.assertEqual(self.request('/pricing.js')[0],200)
+    def test_price_print_and_every_export_have_company_date_categories_and_exact_prices(self):
+        import io,zipfile,xml.etree.ElementTree as ET
+        from datetime import date
+        self.request('/api/company',dict(name='ООО Кухня',inn='1234567890',address='Москва, ул. Кухонная, 1',phone='+7 900 123-45-67'))
+        iid=json.loads(self.request('/api/items',dict(name='Филе сувид',kind='finished',unit='кг',sale_price=947,folder='Кулинария/Сувид',category='Птица'))[1])['id']
+        token=json.loads(self.request('/api/pricing')[1])['token']
+        self.request('/api/prices',dict(token=token,column=dict(name='Дистрибьютор',source_id=1,adjustment=-15,round_step=10),apply=True,responsible='М'))
+        token=json.loads(self.request('/api/pricing')[1])['token']
+        self.request('/api/prices',dict(token=token,list_id=2,changes=[dict(item_id=iid,mode='manual',amount=777.25)],apply=True,responsible='М'))
+        before=json.loads(self.request('/api/state')[1])
+        for fmt in ('html','csv','json','xlsx','docx'):
+            _,raw,_=self.request('/api/export?type=prices&format='+fmt)
+            if fmt in ('xlsx','docx'):
+                with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                    xml=z.read('word/document.xml' if fmt=='docx' else 'xl/worksheets/sheet1.xml')
+                    text=' '.join(ET.fromstring(xml).itertext())
+                    if fmt=='docx':self.assertIn(b'gridSpan',xml)
+            else:text=raw.decode('utf-8-sig')
+            for value in ('Прайс-лист','ООО Кухня',date.today().strftime('%d.%m.%Y'),'Папка: Кулинария/Сувид','Категория: Птица','Дистрибьютор','Филе сувид'):
+                self.assertIn(value,text)
+            self.assertIn('777,25' if fmt in ('html','docx') else '777.25',text)
+            if fmt=='html':self.assertIn('colspan="5"',text);self.assertIn('<thead>',text)
+        after=json.loads(self.request('/api/state')[1])
+        for key in ('items','partners','recipes','lots','orders','order_lines','documents','pricing'):self.assertEqual(before[key],after[key])
+        # Purchasing analytics still exports purchase prices, independently of sale-price columns.
+        text=self.request('/api/export?type=purchase_prices&format=html')[1].decode();self.assertIn('История закупочных цен',text);self.assertNotIn('Дистрибьютор',text)
+
     def test_genuine_v4_restore_upgrades_without_changing_source(self):
         import base64,hashlib,tempfile
         from pathlib import Path

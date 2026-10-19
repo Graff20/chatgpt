@@ -17,13 +17,13 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from contextlib import closing
 from domain import Store, ValidationError, dumps, SCHEMA_VERSION
-from exports import document_table, export, invoice_html, receipt_html, production_html
+from exports import document_table, export, invoice_html, receipt_html, production_html, price_list_table, price_list_html, price_list_docx
 
 ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.5.0'
+APP_VERSION='0.5.1'
 
 ASSETS=('index.html','app.js','pricing.js','style.css')
 
@@ -93,6 +93,8 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/export':
             state=self.store.snapshot(); typ=q.get('type',['stock'])[0]; fmt=q.get('format',['xlsx'])[0]
             title,rows=self.export_rows(state,typ,q)
+            if typ=='prices' and fmt=='docx':return self.send(200,price_list_docx(state),'application/vnd.openxmlformats-officedocument.wordprocessingml.document','ceh-price-list.docx')
+            if typ=='prices' and fmt=='html':return self.send(200,price_list_html(state),'text/html; charset=utf-8')
             if typ=='document' and fmt=='html':
                 doc=next((d for d in state['documents'] if d['id']==int(q.get('id',['0'])[0])),None)
                 if doc and doc['kind']=='production':
@@ -124,12 +126,7 @@ class Handler(BaseHTTPRequestHandler):
     def export_rows(self,state,typ,q):
         items={i['id']:i for i in state['items']}
         ident=int(q.get('id',['0'])[0])
-        if typ=='prices':
-            pricing=state['pricing'];cols=pricing['lists'];cells={(r['list_id'],r['item_id']):r for r in pricing['cells']}
-            rows=[['№','Папка','Категория','Наименование','Ед.']+[r['name'] for r in cols]]
-            products=sorted((i for i in state['items'] if i['kind']=='finished' and i['mode']=='stock' and i['active']),key=lambda i:(i['folder'].casefold(),i['category'].casefold(),i['name'].casefold()))
-            for n,i in enumerate(products,1):rows.append([n,i['folder'],i['category'],i['name'],i['unit']]+[cells[(r['id'],i['id'])]['price'] if cells[(r['id'],i['id'])]['price'] is not None else cells[(r['id'],i['id'])]['reason'] for r in cols])
-            return 'Прайс-лист — готовая продукция',rows
+        if typ=='prices':return price_list_table(state)
         if typ=='document':
             doc=next((x for x in state['documents'] if x['id']==ident),None)
             if not doc: raise ValidationError('Документ не найден')
@@ -244,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
             all_columns={'qty':(2,'Количество'),'revenue':(3,'Выручка, ₽'),'cost':(4,'Себестоимость, ₽'),'profit':(5,'Валовая прибыль, ₽')}
             selected=[k for k in q.get('columns',['qty,revenue,cost,profit'])[0].split(',') if k in all_columns]
             return 'Продажи и валовая прибыль',[['Группа','Ед.']+[all_columns[k][1] for k in selected]]+[[r[0],r[1]]+[(r+[r[3]-r[4]])[all_columns[k][0]] for k in selected] for r in result.values()]
-        if typ=='prices':
+        if typ=='purchase_prices':
             rows=[['Дата','Сырьё','Поставщик','Цена, ₽','Ед.','Количество']]
             for d in state['documents']:
                 if d['kind']=='receipt' and not d['reversed'] and q.get('from',['0001-01-01'])[0]<=d['date']<=q.get('to',['9999-12-31'])[0]:

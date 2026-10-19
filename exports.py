@@ -89,14 +89,31 @@ def archive(files):
         for k,v in files.items(): z.writestr(k,'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'+v)
     return b.getvalue()
 
-def word(title,rows):
+def word(title,rows,grouped=False):
     ns='http://schemas.openxmlformats.org/wordprocessingml/2006/main'
     def paragraph(t): return '<w:p><w:r><w:t xml:space="preserve">'+xml_escape(str(t))+'</w:t></w:r></w:p>'
-    table=''.join('<w:tr>'+''.join('<w:tc>'+paragraph(v)+'</w:tc>' for v in row)+'</w:tr>' for row in rows)
+    prefix=paragraph(title)
+    if grouped:
+        at=next(n for n,r in enumerate(rows) if r and r[0]=='№')
+        prefix+=''.join(paragraph(r[0]+': '+str(r[1])) for r in rows[:at] if len(r)>1)
+        prefix+=paragraph('Цены в рублях за указанную единицу измерения. Без НДС.')
+        width=len(rows[at]);table=''
+        for n,row in enumerate(rows[at:]):
+            section=len(row)==1
+            cells=[]
+            for j,v in enumerate(row):
+                text=f'{v:,.2f}'.replace(',',' ').replace('.',',') if j>=3 and isinstance(v,(int,float)) else v
+                props=('<w:gridSpan w:val="'+str(width)+'"/><w:shd w:fill="E7EEE8"/>') if section else '<w:shd w:fill="F3F6EF"/>' if n==0 else ''
+                content=paragraph(text)
+                if section or n==0:content=content.replace('<w:r>','<w:r><w:rPr><w:b/></w:rPr>')
+                cells.append('<w:tc><w:tcPr>'+props+'</w:tcPr>'+content+'</w:tc>')
+            table+='<w:tr>'+('<w:trPr><w:tblHeader/></w:trPr>' if n==0 else '')+''.join(cells)+'</w:tr>'
+    else:
+        table=''.join('<w:tr>'+''.join('<w:tc>'+paragraph(v)+'</w:tc>' for v in row)+'</w:tr>' for row in rows)
     return archive({
         '[Content_Types].xml':'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
         '_rels/.rels':'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
-        'word/document.xml':f'<w:document xmlns:w="{ns}"><w:body>'+paragraph(title)+'<w:tbl><w:tblPr><w:tblBorders>'+''.join(f'<w:{x} w:val="single" w:sz="4" w:color="CCCCCC"/>' for x in ('top','left','bottom','right','insideH','insideV'))+'</w:tblBorders></w:tblPr>'+table+'</w:tbl><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:body></w:document>'})
+        'word/document.xml':f'<w:document xmlns:w="{ns}"><w:body>'+prefix+'<w:tbl><w:tblPr><w:tblBorders>'+''.join(f'<w:{x} w:val="single" w:sz="4" w:color="CCCCCC"/>' for x in ('top','left','bottom','right','insideH','insideV'))+'</w:tblBorders></w:tblPr>'+table+'</w:tbl><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:body></w:document>'})
 
 def export(title,rows,fmt):
     rows=[[title],[]]+rows
@@ -177,3 +194,42 @@ def production_html(doc):
     for w in d.get('workers',[]):body+='<tr>'+''.join('<td>'+e(v)+'</td>' for v in [w['name'],w['qty'],w['unit']])+'</tr>'
     body+='</table><p>Примечание: '+e(doc.get('note') or '—')+'</p><div class="sign"><span>Изготовил: __________ / __________</span><span>Принял на склад: __________ / __________</span></div>'
     return print_page(f'Выпуск продукции № {doc["id"]:06} от {display(doc["date"])}',body)
+
+def price_list_table(state):
+    """Export the displayed sale prices, never recalculate a separate export formula."""
+    from datetime import date
+    company=state['company'];pricing=state['pricing'];columns=pricing['lists']
+    cells={(r['list_id'],r['item_id']):r for r in pricing['cells']}
+    rows=[['Организация',company['name']]]
+    for key,label in [('inn','ИНН'),('address','Адрес'),('phone','Телефон')]:
+        if company.get(key):rows.append([label,company[key]])
+    rows += [['Дата',date.today().strftime('%d.%m.%Y')],[],['№','Наименование','Ед.']+[c['name'] for c in columns]]
+    products=sorted((i for i in state['items'] if i['kind']=='finished' and i['mode']=='stock' and i['active']),key=lambda i:(i['folder'].casefold(),i['category'].casefold(),i['name'].casefold()))
+    folder=category=None
+    for n,i in enumerate(products,1):
+        if folder!=i['folder']:
+            folder=i['folder'];category=None;rows.append(['Папка: '+(folder or 'Без папки')])
+        if category!=i['category']:
+            category=i['category'];rows.append(['Категория: '+(category or 'Без категории')])
+        rows.append([n,i['name'],i['unit']]+[cells[(c['id'],i['id'])]['price'] if cells[(c['id'],i['id'])]['price'] is not None else cells[(c['id'],i['id'])]['reason'] for c in columns])
+    return 'Прайс-лист',rows
+
+def price_list_html(state):
+    title,rows=price_list_table(state);at=next(n for n,r in enumerate(rows) if r and r[0]=='№');headers=rows[at]
+    meta=''.join('<p><strong>'+escape(r[0])+':</strong> '+escape(str(r[1]))+'</p>' for r in rows[:at] if len(r)>1)
+    lines=[]
+    for row in rows[at+1:]:
+        if len(row)==1:lines.append('<tr class="price-section"><th colspan="'+str(len(headers))+'">'+escape(row[0])+'</th></tr>')
+        else:
+            cells=[]
+            for j,value in enumerate(row):
+                text=f'{value:,.2f}'.replace(',',' ').replace('.',',') if j>=3 and isinstance(value,(int,float)) else display(value)
+                cells.append('<td'+(' class="price-number"' if j>=3 else '')+'>'+escape(text)+'</td>')
+            lines.append('<tr>'+''.join(cells)+'</tr>')
+    body='<style>.price-meta p{margin:3px 0}.price-number{text-align:right;white-space:nowrap}.price-section th{background:#e7eee8;font-size:14px}.price-list th:nth-child(2){min-width:240px}</style><div class="price-meta">'+meta+'</div><p>Цены в рублях за указанную единицу измерения. Без НДС.</p><table class="price-list"><thead><tr>'+''.join('<th>'+escape(str(h))+'</th>' for h in headers)+'</tr></thead><tbody>'+''.join(lines)+'</tbody></table>'
+    if not any(len(r)>1 for r in rows[at+1:]):body+='<p>Готовая продукция отсутствует.</p>'
+    return print_page(title,body)
+
+
+def price_list_docx(state):
+    return word(*price_list_table(state),grouped=True)
