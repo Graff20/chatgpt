@@ -98,29 +98,114 @@ class AdjustmentsMixin:
             self.recalculate_costs(c,{item['id']},who,reason)
             return doc['id']
 
-    def delete_document(self,d):
+    def deletion_plan(self,c,d):
+        """Trace active downstream operations before reversing any movements."""
+        import hashlib
+        from domain import ValidationError
+        docs={r['id']:dict(r) for r in c.execute('SELECT * FROM documents ORDER BY id')}
+        payloads={ident:json.loads(doc['data']) for ident,doc in docs.items()}
+        reversed_ids=self.reversed_ids(c)
+        active={ident for ident,doc in docs.items() if doc['kind']!='reversal' and ident not in reversed_ids and not payloads[ident].get('deleted')}
+        order_id=int(d.get('order_id') or 0)
+        if order_id:
+            root=self.one(c,'orders',order_id)
+            if root['status']=='deleted':raise ValidationError('Заказ уже удалён')
+            seeds={ident for ident in active if docs[ident]['kind']=='shipment' and payloads[ident].get('order_id')==order_id}
+        else:
+            root=self.one(c,'documents',d.get('document_id'))
+            if root['kind']=='reversal':raise ValidationError('Служебная запись отмены сохраняется в истории')
+            if payloads[root['id']].get('deleted'):raise ValidationError('Документ уже удалён')
+            seeds={root['id']}
+        moves=[dict(r) for r in c.execute('SELECT * FROM movements ORDER BY id')]
+        by_doc={};by_lot={}
+        for m in moves:
+            if m['document_id'] in active:
+                by_doc.setdefault(m['document_id'],[]).append(m);by_lot.setdefault(m['lot_id'],[]).append(m)
+        selected=set(seeds);edges={}
+        while True:
+            previous=set(selected)
+            for ident in sorted(selected):
+                if ident not in active:continue
+                deps=edges.setdefault(ident,set());doc=docs[ident];data=payloads[ident]
+                for m in by_doc.get(ident,[]):
+                    deps.update(later['document_id'] for later in by_lot[m['lot_id']] if later['id']>m['id'] and later['document_id']!=ident)
+                    deps.update(other for other in active if other>ident and docs[other]['kind']=='release' and payloads[other].get('lot_id')==m['lot_id'])
+                if doc['kind']=='release':deps.update(m['document_id'] for m in by_lot.get(data['lot_id'],[]) if m['document_id']>ident)
+                if doc['kind']=='shipment':
+                    deps.update(other for other in active if docs[other]['kind'] in ('return','exchange') and payloads[other].get('shipment_id')==ident)
+                    deps.update(other for other in active if docs[other]['kind']=='expense' and any(a['document_id']==ident for a in payloads[other].get('allocations',[])))
+                selected.update(deps)
+            # Payroll payouts are pooled per employee; include them only if removing this
+            # set of productions would leave paid wages above the remaining accrual.
+            workers={w['employee_id'] for ident in selected if ident in active and docs[ident]['kind']=='production' for w in payloads[ident].get('workers',[])}
+            for worker in workers:
+                accrued=sum(w['amount'] for ident in active-selected if docs[ident]['kind']=='production' for w in payloads[ident].get('workers',[]) if w['employee_id']==worker)
+                payments={ident for ident in active-selected if docs[ident]['kind']=='expense' and payloads[ident].get('already_in_cost') and payloads[ident].get('employee_id')==worker}
+                if sum(docs[ident]['total'] for ident in payments)>accrued+1e-7:
+                    for ident in selected:
+                        if docs[ident]['kind']=='production' and any(w['employee_id']==worker for w in payloads[ident].get('workers',[])):edges.setdefault(ident,set()).update(payments)
+                    selected.update(payments)
+            if previous==selected:break
+        sequence=[];visited=set();visiting=set()
+        def visit(ident):
+            if ident in visited:return
+            if ident in visiting:raise ValidationError('Обнаружена циклическая связь документов; удаление не выполнено')
+            visiting.add(ident)
+            for dep in sorted(edges.get(ident,()),reverse=True):visit(dep)
+            visiting.remove(ident);visited.add(ident);sequence.append(ident)
+        for ident in sorted(selected,reverse=True):visit(ident)
+        # The token covers quantities and accounting metadata too, so another employee
+        # cannot silently expand the confirmed cascade between preview and deletion.
+        state=[list(docs.values()),moves,[dict(r) for r in c.execute('SELECT * FROM lots ORDER BY id')],[dict(r) for r in c.execute('SELECT * FROM orders ORDER BY id')]]
+        token=hashlib.sha256(json.dumps(state,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+        visible=[dict(id=ident,kind=docs[ident]['kind'],date=docs[ident]['date'],total=docs[ident]['total'],responsible=docs[ident]['responsible']) for ident in sequence]
+        dependents=[r for r in visible if order_id or r['id']!=root['id']]
+        return dict(token=token,documents=visible,dependents=dependents,order_id=order_id,document_id=None if order_id else root['id'])
+
+    def deletion_preview(self,d):
+        from contextlib import closing
+        with closing(self.connect()) as c:
+            c.execute('BEGIN');return self.deletion_plan(c,d)
+
+    def delete_document_in_transaction(self,c,d):
         from domain import required,dumps,ValidationError
+        doc=self.one(c,'documents',d.get('document_id'));data=json.loads(doc['data'])
+        if data.get('deleted'):raise ValidationError('Документ уже удалён')
+        if doc['kind']=='reversal':raise ValidationError('Служебная запись отмены сохраняется в истории')
+        who=required(d.get('responsible'),'Ответственный');reason=required(d.get('reason'),'Причина удаления')
+        if doc['id'] not in self.reversed_ids(c):
+            reversal=self.reverse_in_transaction(c,dict(d,date=max(date.today().isoformat(),doc['date'])))
+            service=self.one(c,'documents',reversal);payload=json.loads(service['data']);payload['deletion']=True
+            c.execute('UPDATE documents SET data=? WHERE id=?',(dumps(payload),reversal))
+        data['deleted']={'at':datetime.now().isoformat(),'responsible':who,'reason':reason}
+        if d.get('cascade_root'):data['deleted']['cascade_root']=d['cascade_root']
+        c.execute('UPDATE documents SET data=? WHERE id=?',(dumps(data),doc['id']))
+        return doc['id']
+
+    def delete_cascade_in_transaction(self,c,d,order=False):
+        from domain import ValidationError
+        request=dict(order_id=d.get('id')) if order else dict(document_id=d.get('document_id'))
+        plan=self.deletion_plan(c,request)
+        if d.get('expected_token')!=plan['token']:raise ValidationError('Данные изменились. Закройте окно и повторите удаление для просмотра актуального списка')
+        root=('Заказ № ' if order else 'Документ № ')+str(d.get('id') if order else d.get('document_id'))
+        for doc in plan['documents']:
+            self.delete_document_in_transaction(c,dict(d,document_id=doc['id'],cascade_root=root))
+
+    def delete_document(self,d):
         with self.transaction() as c:
-            doc=self.one(c,'documents',d.get('document_id'));data=json.loads(doc['data'])
-            if data.get('deleted'):raise ValidationError('Документ уже удалён')
-            if doc['kind']=='reversal':raise ValidationError('Служебная запись отмены сохраняется в истории')
-            who=required(d.get('responsible'),'Ответственный');reason=required(d.get('reason'),'Причина удаления')
-            if doc['id'] not in self.reversed_ids(c):
-                reversal=self.reverse_in_transaction(c,dict(d,date=date.today().isoformat()))
-                service=self.one(c,'documents',reversal);payload=json.loads(service['data']);payload['deletion']=True
-                c.execute('UPDATE documents SET data=? WHERE id=?',(dumps(payload),reversal))
-            data['deleted']={'at':datetime.now().isoformat(),'responsible':who,'reason':reason}
-            c.execute('UPDATE documents SET data=? WHERE id=?',(dumps(data),doc['id']))
-            return doc['id']
+            if d.get('cascade'):
+                self.delete_cascade_in_transaction(c,d);return int(d['document_id'])
+            return self.delete_document_in_transaction(c,d)
 
     def delete_order(self,d):
         from domain import required,ValidationError
         with self.transaction() as c:
             order=self.one(c,'orders',d.get('id'))
             if order['status']=='deleted':raise ValidationError('Заказ уже удалён')
+            who=required(d.get('responsible'),'Ответственный');reason=required(d.get('reason'),'Причина удаления')
+            if d.get('cascade'):self.delete_cascade_in_transaction(c,d,order=True)
             if any(r['id'] not in self.reversed_ids(c) for r in c.execute("SELECT id FROM documents WHERE kind='shipment' AND json_extract(data,'$.order_id')=?",(order['id'],))):
                 raise ValidationError('Сначала удалите или отмените отгрузки по заказу')
-            who=required(d.get('responsible'),'Ответственный');reason=required(d.get('reason'),'Причина удаления')
             c.execute("UPDATE orders SET status='deleted',note=note||? WHERE id=?",(f'\nУдалён {datetime.now().isoformat()}: {reason}. {who}',order['id']))
             return order['id']
 

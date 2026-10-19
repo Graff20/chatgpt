@@ -195,10 +195,16 @@ def production_html(doc):
     body+='</table><p>Примечание: '+e(doc.get('note') or '—')+'</p><div class="sign"><span>Изготовил: __________ / __________</span><span>Принял на склад: __________ / __________</span></div>'
     return print_page(f'Выпуск продукции № {doc["id"]:06} от {display(doc["date"])}',body)
 
-def price_list_table(state):
+def price_list_table(state,column_ids=None):
     """Export the displayed sale prices, never recalculate a separate export formula."""
     from datetime import date
     company=state['company'];pricing=state['pricing'];columns=pricing['lists']
+    if column_ids is not None:
+        from domain import ValidationError
+        try:ids={int(x) for x in column_ids}
+        except (ValueError,TypeError):raise ValidationError('Неверный выбор столбцов цен')
+        if not ids or ids-{c['id'] for c in columns}:raise ValidationError('Отметьте хотя бы один существующий столбец цен')
+        columns=[c for c in columns if c['id'] in ids]
     cells={(r['list_id'],r['item_id']):r for r in pricing['cells']}
     rows=[['Организация',company['name']]]
     for key,label in [('inn','ИНН'),('address','Адрес'),('phone','Телефон')]:
@@ -214,8 +220,8 @@ def price_list_table(state):
         rows.append([n,i['name'],i['unit']]+[cells[(c['id'],i['id'])]['price'] if cells[(c['id'],i['id'])]['price'] is not None else cells[(c['id'],i['id'])]['reason'] for c in columns])
     return 'Прайс-лист',rows
 
-def price_list_html(state):
-    title,rows=price_list_table(state);at=next(n for n,r in enumerate(rows) if r and r[0]=='№');headers=rows[at]
+def price_list_html(state,column_ids=None):
+    title,rows=price_list_table(state,column_ids);at=next(n for n,r in enumerate(rows) if r and r[0]=='№');headers=rows[at]
     meta=''.join('<p><strong>'+escape(r[0])+':</strong> '+escape(str(r[1]))+'</p>' for r in rows[:at] if len(r)>1)
     lines=[]
     for row in rows[at+1:]:
@@ -231,5 +237,5 @@ def price_list_html(state):
     return print_page(title,body)
 
 
-def price_list_docx(state):
-    return word(*price_list_table(state),grouped=True)
+def price_list_docx(state,column_ids=None):
+    return word(*price_list_table(state,column_ids),grouped=True)

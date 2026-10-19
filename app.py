@@ -23,7 +23,7 @@ ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.5.1'
+APP_VERSION='0.5.2'
 
 ASSETS=('index.html','app.js','pricing.js','style.css')
 
@@ -77,6 +77,8 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc(); self.send(500,{'error':'Ошибка сервера. Подробности в окне запуска.'})
     def get(self):
         u=urlparse(self.path); q=parse_qs(u.query); path=u.path
+        column_query=parse_qs(u.query,keep_blank_values=True)
+        if 'price_columns' in column_query:q['price_columns']=column_query['price_columns']
         if path=='/api/runtime': return self.send(200,self.server.runtime_info())
         if path=='/api/state':
             state=self.store.snapshot()
@@ -92,9 +94,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200,target.read_bytes(),'application/vnd.sqlite3','ceh-backup.sqlite3')
         if path=='/api/export':
             state=self.store.snapshot(); typ=q.get('type',['stock'])[0]; fmt=q.get('format',['xlsx'])[0]
+            selected_columns=q['price_columns'][0].split(',') if 'price_columns' in q else None
             title,rows=self.export_rows(state,typ,q)
-            if typ=='prices' and fmt=='docx':return self.send(200,price_list_docx(state),'application/vnd.openxmlformats-officedocument.wordprocessingml.document','ceh-price-list.docx')
-            if typ=='prices' and fmt=='html':return self.send(200,price_list_html(state),'text/html; charset=utf-8')
+            if typ=='prices' and fmt=='docx':return self.send(200,price_list_docx(state,selected_columns),'application/vnd.openxmlformats-officedocument.wordprocessingml.document','ceh-price-list.docx')
+            if typ=='prices' and fmt=='html':return self.send(200,price_list_html(state,selected_columns),'text/html; charset=utf-8')
             if typ=='document' and fmt=='html':
                 doc=next((d for d in state['documents'] if d['id']==int(q.get('id',['0'])[0])),None)
                 if doc and doc['kind']=='production':
@@ -126,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
     def export_rows(self,state,typ,q):
         items={i['id']:i for i in state['items']}
         ident=int(q.get('id',['0'])[0])
-        if typ=='prices':return price_list_table(state)
+        if typ=='prices':return price_list_table(state,q['price_columns'][0].split(',') if 'price_columns' in q else None)
         if typ=='document':
             doc=next((x for x in state['documents'] if x['id']==ident),None)
             if not doc: raise ValidationError('Документ не найден')
@@ -266,6 +269,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(d,dict): raise ValidationError('Ожидается объект JSON')
             with LOCK:
                 if self.path in ('/api/restore','/api/restore-preview'): return self.restore(dict(d,preview=self.path=='/api/restore-preview'))
+                if self.path=='/api/deletion-preview':return self.send(200,self.store.deletion_preview(d))
                 if self.path=='/api/prices':return self.send(200,self.store.edit_prices(d))
                 actions={'/api/delete-document':self.store.delete_document,'/api/delete-order':self.store.delete_order,'/api/dispatch-summary':self.store.dispatch_summary,'/api/recalculate':self.store.recalculate,'/api/production-workers':self.store.update_production_workers,'/api/employees':self.store.save_employee,'/api/jobs':self.store.save_job,'/api/exchange':self.store.exchange,'/api/refund':self.store.refund,'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
                     '/api/receipt':self.store.receipt,'/api/production':self.store.production,'/api/orders':self.store.save_order,
