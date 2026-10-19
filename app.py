@@ -23,7 +23,7 @@ ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.3.1'
+APP_VERSION='0.4.0'
 
 ASSETS=('index.html','app.js','style.css')
 
@@ -83,6 +83,7 @@ class Handler(BaseHTTPRequestHandler):
             state['runtime']=self.server.runtime_info()
             return self.send(200,state)
         if path=='/api/route': return self.send(200,self.store.route(q.get('date',[date.today().isoformat()])[0],q.get('driver_id',[None])[0]))
+        if path=='/api/financial': return self.send(200,self.store.financial_report(q.get('from',[date.today().replace(day=1).isoformat()])[0],q.get('to',[date.today().isoformat()])[0]))
         if path=='/api/plan': return self.send(200,self.store.plan(q.get('date',[date.today().isoformat()])[0]))
         if path=='/api/backup':
             target=self.server.data/'backups'/f'manual-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3'
@@ -148,12 +149,16 @@ class Handler(BaseHTTPRequestHandler):
             if not order: raise ValidationError('Заказ не найден')
             client=next(p for p in state['partners'] if p['id']==order['client_id'])
             rows=[['Клиент',client['name']],['К отгрузке',order['due']],['Менеджер',order['manager']],['Товар','Заказано','Отгружено','Ед.','Цена, ₽']]
-            rows += [[items[l['item_id']]['name'],l['qty'],l['shipped'],items[l['item_id']]['unit'],l['price']] for l in state['order_lines'] if l['order_id']==ident]
+            lines=[l for l in state['order_lines'] if l['order_id']==ident]
+            if any(l['order_mode']=='portions' for l in lines):
+                rows=rows[:3]+[['Товар','Порций заказано','План веса / количества','Ед.','Порций отгружено','Факт веса / количества','Цена за ед., ₽']]
+                rows += [[items[l['item_id']]['name'],l['portions'] or '',l['qty'],items[l['item_id']]['unit'],l['shipped_portions'] or '',l['shipped'],l['price']] for l in lines]
+            else:rows += [[items[l['item_id']]['name'],l['qty'],l['shipped'],items[l['item_id']]['unit'],l['price']] for l in lines]
             return f'Заказ № {ident}',rows
         if typ=='plan':
             plan=self.store.plan(q.get('date',[date.today().isoformat()])[0])
-            rows=[['Товар','Заказано','Годный остаток','Потребность ранних заказов','Свободно','Произвести','Ед.']]
-            rows += [[r['name'],r['ordered'],r['available'],r['prior_demand'],r['free'],r['produce'],r['unit']] for r in plan['products']]
+            rows=[['Товар','Заказано, план','Годный остаток','Потребность ранних заказов','Свободно','Произвести','Ед.','Порций в открытых заказах']]
+            rows += [[r['name'],r['ordered'],r['available'],r['prior_demand'],r['free'],r['produce'],r['unit'],r.get('remaining_portions',0) or ''] for r in plan['products']]
             rows += [[],['Сырьё','Требуется','Доступно сейчас','Дефицит','Ед.']]
             rows += [[r['name'],r['qty'],r['available'],r['shortage'],r['unit']] for r in plan['ingredients']]
             return 'Наряд на '+plan['date'],rows
@@ -161,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
             route=self.store.route(q.get('date',[date.today().isoformat()])[0],q.get('driver_id',[None])[0])
             rows=[['Отправитель',route['company']['name']],['Дата',route['date']],[],['Водитель / авто','Порядок','Заказ / время','Клиент','Адрес','Телефон','Контактное лицо','Накладные','Продукция: план / факт','Сумма накладных, ₽','Осталось оплатить, ₽','Отметка / подпись']]
             for n,stop in enumerate(route['stops'],1):
-                goods='; '.join(f"{g['name']}: {g['planned']} / {g['actual']} {g['unit']}" for g in stop['goods'])
+                goods='; '.join(f"{g['name']}: {g['planned']} / {g['actual']} {g['unit']}"+(f"; порций {g['portions']} / {g['shipped_portions']}" if g.get('portions') else '') for g in stop['goods'])
                 rows.append([stop['driver_name']+' · '+stop['driver_phone']+' / '+stop['vehicle'],stop['position'] or n,str(stop['order_id'])+' / '+stop['due'][11:],stop['client'],stop['address'],stop['phone'],stop['contact'],', '.join(map(str,stop['invoice_numbers'])),goods,stop['total'],stop['to_collect'],''])
             rows.append(['Итого','','','','','','','','',round(sum(s['total'] for s in route['stops']),2),round(sum(s['to_collect'] for s in route['stops']),2),''])
             return 'Маршрутный лист — '+route['date'],rows
@@ -179,7 +184,22 @@ class Handler(BaseHTTPRequestHandler):
             history=json.loads(job['revisions']);revision=int(q.get('revision',[str(len(history)+1)])[0])
             if not 1<=revision<=len(history)+1:raise ValidationError('Версия наряда не найдена')
             products=job['products'] if revision==len(history)+1 else history[revision-1]['previous_products']
-            return f'Наряд № {ident:06}',[['Версия наряда',revision],['Дата исполнения',job['date']],['Создан',job['created']],['Ответственный',job['responsible']],['Статус',job['status']],[],['Продукция','План выпуска','Ед.']]+[[p['name'],p['qty'],p['unit']] for p in products]
+            return f'Наряд № {ident:06}',[['Версия наряда',revision],['Дата исполнения',job['date']],['Создан',job['created']],['Ответственный',job['responsible']],['Статус',job['status']],[],['Продукция','План выпуска','Ед.','Порций в заказах (справочно)']]+[[p['name'],p['qty'],p['unit'],p.get('portions',0) or ''] for p in products]
+        if typ=='financial':
+            f=self.store.financial_report(q.get('from',[date.today().replace(day=1).isoformat()])[0],q.get('to',[date.today().isoformat()])[0])
+            view=q.get('view',['category'])[0]
+            if view not in ('total','category','detail'):raise ValidationError('Неверный вид структуры расходов')
+            rows=[['Период',f['start'],f['end']],['Показатель','Сумма, ₽']]
+            rows += [[label,f[key]] for key,label in [('revenue','Выручка с возвратами'),('cogs','Производственная себестоимость продаж'),('gross_profit','Валовая прибыль'),('expenses','Расходы, уменьшающие результат'),('writeoffs','Списания'),('exchanges','Изменение стоимости физобменов'),('result','Результат периода'),('cash_expenses','Все денежные расходы'),('payroll_paid','Из них выплаты начисленной зарплаты'),('payments','Поступило от клиентов'),('refunds','Возвращено клиентам'),('cash_change','Изменение денег')]]
+            rows += [[],['Расходы общей суммой, ₽',f['cash_expenses']]]
+            if view=='category':
+                rows += [[],['Статья','Операций','Денежные расходы, ₽','Уменьшают результат, ₽','Выплаты зарплаты, ₽']]
+                rows += [[r['category'],r['count'],round(r['cash'],2),round(r['deductible'],2),round(r['payroll_paid'],2)] for r in f['categories']]
+            if view=='detail':
+                rows += [[],['Дата','Документ','Статья','На что потрачено','Кому оплачено','Сумма, ₽','Уменьшает результат, ₽','Ответственный']]
+                rows += [[d['date'],d['id'],d['category'],d['purpose'],d['recipient'],d['amount'],d['deductible'],d['responsible']] for d in f['details']]
+            rows += [[],['Примечание','Выплаты уже начисленной зарплаты не вычитаются из результата повторно. Кассовое движение и результат продаж показаны отдельно.']]
+            return 'Финансовые итоги за период',rows
         if typ=='fullcost':
             rows=[['Счёт','Дата','Клиент','Выручка с возвратами, ₽','Производственная стоимость, ₽','Распределённые расходы, ₽','Обмены, ₽','Полная стоимость, ₽','Результат, ₽']]
             effective=[d for d in state['documents'] if not d['reversed']]
@@ -267,7 +287,7 @@ class Handler(BaseHTTPRequestHandler):
             with closing(sqlite3.connect(f'file:{temp.as_posix()}?mode=ro',uri=True)) as c:
                 c.execute('PRAGMA trusted_schema=OFF')
                 if c.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise ValidationError('Повреждённая база')
-                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,2,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
+                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,2,3,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
                 for table in ('items','partners','lots','movements','recipes','documents','orders','order_lines'):
                     if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone(): raise ValidationError('Неверная структура базы')
                 if c.execute('PRAGMA foreign_key_check').fetchone(): raise ValidationError('Повреждены связи базы')

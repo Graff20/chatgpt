@@ -125,7 +125,7 @@ class AdjustmentsMixin:
             return order['id']
 
     def dispatch_summary(self,d):
-        from domain import required,ValidationError,dumps
+        from domain import required,ValidationError,dumps,remaining_quantity,remaining_portions
         raw=d.get('order_ids',[])
         if not isinstance(raw,list) or not raw or len(raw)>5000:raise ValidationError('Отметьте заказы для сводной ведомости')
         ids=[int(v) for v in raw]
@@ -140,11 +140,31 @@ class AdjustmentsMixin:
                 partner=self.one(c,'partners',order['client_id'])
                 details=[]
                 for line in c.execute('SELECT * FROM order_lines WHERE order_id=? ORDER BY id',(oid,)):
-                    qty=max(0,line['qty']-line['shipped']) if mode=='remaining' else line['qty']
+                    qty=remaining_quantity(line) if mode=='remaining' else line['qty']
+                    portions=remaining_portions(line) if mode=='remaining' else line['portions']
                     if qty<=1e-7:continue
-                    item=self.one(c,'items',line['item_id']);r=products.setdefault(item['id'],dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=0));r['qty']+=qty
-                    details.append(dict(item_id=item['id'],name=item['name'],qty=qty,unit=item['unit']))
+                    item=self.one(c,'items',line['item_id']);r=products.setdefault(item['id'],dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=0,portions=0));r['qty']+=qty;r['portions']+=portions
+                    details.append(dict(item_id=item['id'],name=item['name'],qty=qty,unit=item['unit'],portions=portions,order_mode=line['order_mode']))
                 orders.append(dict(id=oid,client_name=partner['name'],due=order['due'],manager=order['manager'],lines=details))
             if not products:raise ValidationError('В выбранных заказах нет количества к отгрузке; для повторной ведомости выберите полное количество заказа')
             lines=sorted(products.values(),key=lambda r:r['name'].casefold())
             return self.doc(c,'dispatch_summary',d,data={'mode':mode,'orders':orders,'lines':lines})
+
+    def financial_report(self,start,end):
+        from domain import day,ValidationError,money_round
+        start=day(start);end=day(end)
+        if start>end:raise ValidationError('Начало периода должно быть не позже окончания')
+        docs=[d for d in self.snapshot()['documents'] if not d['reversed'] and start<=d['date']<=end]
+        sales=[d for d in docs if d['kind'] in ('shipment','return')]
+        revenue=money_round(sum(d['total']*(-1 if d['kind']=='return' else 1) for d in sales))
+        cogs=money_round(sum(d['cost']*(-1 if d['kind']=='return' else 1) for d in sales))
+        expenses=[d for d in docs if d['kind']=='expense'];groups={};details=[]
+        for d in expenses:
+            data=d['data'];category=data.get('category') or 'Без статьи';cash=d['total'];salary=cash if data.get('already_in_cost') else 0;deductible=cash-salary
+            r=groups.setdefault(category,dict(category=category,cash=0,deductible=0,payroll_paid=0,count=0))
+            r['cash']+=cash;r['deductible']+=deductible;r['payroll_paid']+=salary;r['count']+=1
+            details.append(dict(id=d['id'],date=d['date'],category=category,purpose=data.get('purpose') or d['note'] or 'Назначение не указано',recipient=data.get('recipient') or data.get('employee_name') or '',amount=cash,deductible=deductible,already_in_cost=bool(data.get('already_in_cost')),responsible=d['responsible']))
+        cash=money_round(sum(d['total'] for d in expenses));deductible=money_round(sum(d['total'] for d in expenses if not d['data'].get('already_in_cost')))
+        writeoffs=money_round(sum(d['cost'] for d in docs if d['kind']=='writeoff'));exchanges=money_round(sum(d['cost'] for d in docs if d['kind']=='exchange'))
+        payroll=money_round(cash-deductible);payments=money_round(sum(d['total'] for d in docs if d['kind']=='payment'));refunds=money_round(sum(d['total'] for d in docs if d['kind']=='refund'))
+        return dict(start=start,end=end,revenue=revenue,cogs=cogs,gross_profit=money_round(revenue-cogs),cash_expenses=cash,expenses=deductible,payroll_paid=payroll,writeoffs=writeoffs,exchanges=exchanges,result=money_round(revenue-cogs-deductible-writeoffs-exchanges),payments=payments,refunds=refunds,cash_change=money_round(payments-refunds-cash),categories=sorted(groups.values(),key=lambda r:(-r['cash'],r['category'])),details=sorted(details,key=lambda d:(d['date'],d['id'])),expense_count=len(expenses))

@@ -30,6 +30,11 @@ def document_table(doc):
         rows=[['Исходная отгрузка',data['shipment_id']],['Причина',data['reason']],['Возвращено','Ед.','Количество']]+[[x['name'],x['unit'],x['qty']] for x in data['lines']]
         rows += [[],['Выдана замена','Ед.','Количество']]+[[x['name'],x['unit'],x['qty']] for x in data['replacements']]
         rows += [['Изменение долга, ₽',0],['Стоимость выданной замены, ₽',round(data['replacement_cost'],2)]]
+    elif doc['kind']=='expense':
+        rows=[['Статья расхода',data['category']],['На что потрачено',data.get('purpose') or doc['note'] or 'Назначение не указано'],['Кому оплачено',data.get('recipient') or data.get('employee_name') or '—'],['Сумма, ₽',doc['total']]]
+        if data.get('already_in_cost'):rows.append(['Учёт в результате','Выплата начисленной зарплаты; в себестоимости уже учтена'])
+        if data.get('allocations'):
+            rows += [[],['Распределено на счёт №','Сумма, ₽']]+[[r['document_id'],r['amount']] for r in data['allocations']]
     elif doc['kind']=='dispatch_summary':
         rows=[['Количество','Неотгруженный остаток' if data['mode']=='remaining' else 'Полное количество заказа'],['Заказы',', '.join('№ '+str(o['id']) for o in data['orders'])],[],['№','Наименование','Ед.','План к отгрузке']]
         rows += [[n,l['name'],l['unit'],l['qty']] for n,l in enumerate(data['lines'],1)]
@@ -45,6 +50,8 @@ def document_table(doc):
         rows=[['Документ / партия',data.get('target_id',data.get('lot_id'))],['Причина',data['reason']]]
     else:
         rows=[['Операция','Сумма, ₽'],[data.get('client_name',data.get('category','')),doc['total']]]
+    if doc['kind']=='dispatch_summary' and any(l.get('portions') for l in data['lines']):
+        rows += [[],['Заказанные порции (вес выше ориентировочный)'],['Наименование','Порций']]+[[l['name'],l['portions']] for l in data['lines'] if l.get('portions')]
     if doc['kind']=='receipt': rows=[['Получатель',data.get('company_name','Моё производство')],['Документ поставщика',data.get('supplier_document','')],['Склад',data.get('warehouse','')]]+rows
     if doc['kind']=='production': rows += [[],['Исполнитель','Выработка','Ед.','Расценка, ₽','Начислено, ₽']]+[[w['name'],w['qty'],w['unit'],w['rate'],w['amount']] for w in data.get('workers',[])]
     if doc['kind']=='return': rows=[['Исходная отгрузка',data['shipment_id']],['Причина возврата',data['reason']]]+rows
@@ -134,7 +141,8 @@ def invoice_html(doc):
     body+=f'<p><strong>Поставщик (Кто отгружает):</strong> {e(d.get("sender_name",doc["responsible"]))}<br>Адрес: {e(d.get("sender_address"))}<br>Телефон поставщика: {e(d.get("sender_phone"))}<br><strong>Покупатель:</strong> {e(d["client_name"])}<br><strong>Дата отгрузки:</strong> {e(display(doc["date"]))}<br><strong>Адрес доставки:</strong> {e(d.get("delivery_address"))}<br><strong>Контактное лицо:</strong> {e(d.get("delivery_contact"))}<br><strong>Телефон:</strong> {e(d.get("delivery_phone"))}</p>'
     body+='<table class="invoice-lines"><thead><tr><th>№</th><th>Наименование</th><th>Ед. измерения</th><th>Количество</th><th>Цена, ₽</th><th>Сумма, ₽</th></tr></thead><tbody>'
     for n,l in enumerate(d['lines'],1):
-        body+=f'<tr><td>{n}</td><td>{e(l["name"])}</td><td>{e(l["unit"])}</td><td>{e(display(l["qty"]))}</td><td>{cash(l.get("gross_price",l["price"]))}</td><td>{cash(l.get("gross_total",l.get("line_total",l["qty"]*l["price"])))}</td></tr>'
+        portion_note=('<br><small>'+str(l['portions'])+' порц.</small>') if l.get('portions') else ''
+        body+=f'<tr><td>{n}</td><td>{e(l["name"])}{portion_note}</td><td>{e(l["unit"])}</td><td>{e(display(l["qty"]))}</td><td>{cash(l.get("gross_price",l["price"]))}</td><td>{cash(l.get("gross_total",l.get("line_total",l["qty"]*l["price"])))}</td></tr>'
     body+='</tbody></table><table class="totals"><tr><td>Сумма</td><td>'+cash(d.get('subtotal',doc['total']))+' ₽</td></tr>'
     if d.get('discount_percent'):body+='<tr><td>Скидка '+e(display(d['discount_percent']))+'%</td><td>'+cash(d['discount_amount'])+' ₽</td></tr>'
     body+='<tr><td><strong>ИТОГО</strong></td><td><strong>'+cash(doc['total'])+' ₽</strong></td></tr><tr><td></td><td>Без НДС</td></tr></table>'

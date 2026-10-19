@@ -7,11 +7,19 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from contextlib import contextmanager, closing
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 EPS = 1e-7
 
 def money_round(value):
     return float(Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+def remaining_portions(line):
+    line=dict(line)
+    return max(0,line.get('portions',0)-line.get('shipped_portions',0)) if line.get('order_mode')=='portions' else 0
+
+def remaining_quantity(line):
+    line=dict(line)
+    return remaining_portions(line)*line['portion_weight'] if line.get('order_mode')=='portions' else max(0,line['qty']-line['shipped'])
+
 UNITS = {'кг', 'л', 'шт.', 'уп.'}
 
 class ValidationError(ValueError):
@@ -143,6 +151,18 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                     c.backup(target)
                 self.migrate_v3(c)
                 version = 3
+            if version == 3:
+                backup=self.path.parent/'backups'/f'before-v4-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3'
+                backup.parent.mkdir(exist_ok=True)
+                with closing(sqlite3.connect(backup)) as target:c.backup(target)
+                c.executescript("""BEGIN IMMEDIATE;
+                    ALTER TABLE items ADD COLUMN portion_weight REAL NOT NULL DEFAULT 0;
+                    ALTER TABLE order_lines ADD COLUMN order_mode TEXT NOT NULL DEFAULT 'quantity';
+                    ALTER TABLE order_lines ADD COLUMN portions INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE order_lines ADD COLUMN shipped_portions INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE order_lines ADD COLUMN portion_weight REAL NOT NULL DEFAULT 0;
+                    PRAGMA user_version=4; COMMIT;""")
+                version=4
             if version != SCHEMA_VERSION:
                 raise ValidationError('Версия базы не поддерживается этим приложением')
 
@@ -222,10 +242,10 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                   number(d.get('minimum', 0), 'Минимум', False), number(d.get('price', 0), 'Цена', False),
                   number(d.get('sale_price', 0), 'Цена продажи', False), shelf_hours,
                   mode, dumps(losses), number(d.get('pack_size', 1), 'Состав упаковки'), str(d.get('notes', '')),
-                  int(bool(d.get('active', True))), int(bool(d.get('track_expiry', True)))]+[number(d.get(k,0),k,False) for k in ('labor_rate','overhead_rate','overhead_percent','production_buffer')]
+                  int(bool(d.get('active', True))), int(bool(d.get('track_expiry', True)))]+[number(d.get(k,0),k,False) for k in ('labor_rate','overhead_rate','overhead_percent','production_buffer','portion_weight')]
         if (kind in ('raw','packaging') or mode=='virtual') and any(number(d.get(k,0),k,False)>0 for k in ('labor_rate','overhead_rate','overhead_percent')):
             raise ValidationError('Расценку и производственные расходы задавайте складскому блюду или полуфабрикату; для сырья и виртуального полуфабриката оставьте нули')
-        cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active,track_expiry,labor_rate,overhead_rate,overhead_percent,production_buffer'
+        cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active,track_expiry,labor_rate,overhead_rate,overhead_percent,production_buffer,portion_weight'
         with self.transaction() as c:
             if d.get('id'):
                 old = self.one(c, 'items', d['id'])
@@ -457,11 +477,20 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                 if item['id'] in seen:
                     raise ValidationError('Объедините одинаковые товары в одну строку')
                 seen.add(item['id'])
-                qty = self.quantity(item,line.get('qty'),line.get('unit'))
+                mode=line.get('order_mode','quantity')
+                if mode not in ('quantity','portions'):raise ValidationError('Неверный способ заказа')
+                portions=0;portion_weight=0
+                if mode=='portions':
+                    if item['unit']!='кг':raise ValidationError('Порции доступны только для весовой продукции в кг')
+                    count=number(line.get('portions',line.get('qty')),'Порции')
+                    if count!=int(count):raise ValidationError('Количество порций должно быть целым')
+                    portions=int(count);portion_weight=number(line.get('portion_weight') or item['portion_weight'],'Средний вес порции, кг')
+                    qty=number(portions*portion_weight,'Ориентировочный вес')
+                else:qty = self.quantity(item,line.get('qty'),line.get('unit'))
                 tolerance = number(line.get('tolerance',10),'Допуск',False)
                 if tolerance > 100:
                     raise ValidationError('Допуск от 0 до 100%')
-                c.execute('INSERT INTO order_lines(order_id,item_id,qty,price,tolerance) VALUES(?,?,?,?,?)',(ident,item['id'],qty,number(line.get('price',item['sale_price']),'Цена',False),tolerance))
+                c.execute('INSERT INTO order_lines(order_id,item_id,qty,price,tolerance,order_mode,portions,portion_weight) VALUES(?,?,?,?,?,?,?,?)',(ident,item['id'],qty,number(line.get('price',item['sale_price']),'Цена',False),tolerance,mode,portions,portion_weight))
             self.order_delivery(c,ident,d,client)
             return ident
 
@@ -516,10 +545,15 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                 seen.add(line['id'])
                 item = self.one(c,'items',line['item_id'])
                 q = self.quantity(item,row.get('qty'),row.get('unit'))
-                remaining = line['qty']-line['shipped']
+                remaining = remaining_quantity(line)
                 if remaining <= EPS:
                     raise ValidationError('Строка уже отгружена')
-                if line['shipped']+q > line['qty']*(1+line['tolerance']/100)+EPS:
+                sent_portions=0
+                if line['order_mode']=='portions':
+                    count=number(row.get('portions'),'Отгружаемые порции')
+                    if count!=int(count) or count>remaining_portions(line):raise ValidationError('Количество отгружаемых порций должно быть целым и не превышать остаток заказа')
+                    sent_portions=int(count)
+                if line['order_mode']!='portions' and line['shipped']+q > line['qty']*(1+line['tolerance']/100)+EPS:
                     raise ValidationError(f'{item["name"]}: превышен допуск {line["tolerance"]}%')
                 reserved={}
                 for allocation in self.allocate_orders(c,exclude_order=order['id']):
@@ -530,8 +564,8 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                 gross_total=money_round(q*line['price'])
                 line_total=money_round(Decimal(str(gross_total))*(1-Decimal(str(discount))/100))
                 total += line_total
-                c.execute('UPDATE order_lines SET shipped=shipped+? WHERE id=?',(q,line['id']))
-                rows.append(dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=q,price=line_total/q,gross_price=line['price'],gross_total=gross_total,line_total=line_total,discount_amount=money_round(gross_total-line_total),lots=lots,line_id=line['id']))
+                c.execute('UPDATE order_lines SET shipped=shipped+?,shipped_portions=shipped_portions+? WHERE id=?',(q,sent_portions,line['id']))
+                rows.append(dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=q,price=line_total/q,gross_price=line['price'],gross_total=gross_total,line_total=line_total,discount_amount=money_round(gross_total-line_total),lots=lots,line_id=line['id'],order_mode=line['order_mode'],portions=sent_portions,portion_weight=line['portion_weight']))
             if not rows:
                 raise ValidationError('Добавьте отгружаемое количество')
             if client['debt_limit'] and self.settled_debt(c,client['id'])>=client['debt_limit']-EPS and not d.get('override_reason'):
@@ -546,7 +580,7 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                 delivery_address=order['delivery_address'],delivery_phone=order['delivery_phone'],delivery_contact=order['delivery_contact'],
                 driver_id=order['driver_id'],driver_name=driver['name'] if driver else '',driver_phone=driver['phone'] if driver else '',vehicle=driver['vehicle'] if driver else '')
             c.execute('UPDATE documents SET total=?,cost=?,data=? WHERE id=?',(round(total,2),cost,dumps(data),ident))
-            outstanding = c.execute('SELECT 1 FROM order_lines WHERE order_id=? AND qty-shipped>?',(order['id'],EPS)).fetchone()
+            outstanding = c.execute("SELECT 1 FROM order_lines WHERE order_id=? AND (CASE WHEN order_mode='portions' THEN portions-shipped_portions ELSE qty-shipped END)>?",(order['id'],EPS)).fetchone()
             if not outstanding or d.get('close_order'):
                 if outstanding and not str(d.get('short_reason','')).strip():
                     raise ValidationError('Укажите причину закрытия недопоставленного заказа')
@@ -627,7 +661,7 @@ class Store(WorkflowMixin, AdjustmentsMixin):
         if target['kind']=='release':c.execute('UPDATE lots SET blocked=1 WHERE id=?',(data['lot_id'],))
         if target['kind']=='shipment':
             for line in data['lines']:
-                c.execute('UPDATE order_lines SET shipped=max(0,shipped-?) WHERE id=?',(line['qty'],line['line_id']))
+                c.execute('UPDATE order_lines SET shipped=max(0,shipped-?),shipped_portions=max(0,shipped_portions-?) WHERE id=?',(line['qty'],line.get('portions',0),line['line_id']))
             c.execute("UPDATE orders SET status='open' WHERE id=?",(data['order_id'],))
         return ident
 
@@ -758,7 +792,7 @@ class Store(WorkflowMixin, AdjustmentsMixin):
                 i['planned_cost']=self.planned_cost(c,i['id'])
                 i['available']=sum(l['qty'] for l in result['lots'] if l['item_id']==i['id'] and not l['blocked'] and l['produced']<=now and (not l['expires'] or now<l['expires']))
                 i['expired']=sum(l['qty'] for l in result['lots'] if l['item_id']==i['id'] and l['expires'] and l['expires']<=now)
-                i['demand']=sum(max(0,l['qty']-l['shipped']) for l in result['order_lines'] if l['item_id']==i['id'] and any(o['id']==l['order_id'] and o['status']=='open' for o in result['orders']))
+                i['demand']=sum(remaining_quantity(l) for l in result['order_lines'] if l['item_id']==i['id'] and any(o['id']==l['order_id'] and o['status']=='open' for o in result['orders']))
             reversed_ids=self.reversed_ids(c)
             for doc in result['documents']:
                 doc['reversed']=doc['id'] in reversed_ids
@@ -835,7 +869,7 @@ class Store(WorkflowMixin, AdjustmentsMixin):
             for l in state['order_lines']:
                 if l['order_id']!=o['id']:continue
                 it=next(i for i in state['items'] if i['id']==l['item_id'])
-                goods.append({'name':it['name'],'unit':it['unit'],'planned':l['qty'],'actual':l['shipped']})
+                goods.append({'name':it['name'],'unit':it['unit'],'planned':l['qty'],'actual':l['shipped'],'order_mode':l['order_mode'],'portions':l['portions'],'shipped_portions':l['shipped_portions']})
             stops.append(dict(order_id=o['id'],driver_id=o['driver_id'],driver_name=driver['name'] if driver else 'Не назначен',driver_phone=driver['phone'] if driver else '',vehicle=driver['vehicle'] if driver else '',
                 position=o['route_position'],due=o['due'],client=client['name'],address=o['delivery_address'] or client['address'],phone=o['delivery_phone'] or client['phone'],contact=o['delivery_contact'] or client['contact'],
                 goods=goods,invoice_numbers=[d['id'] for d in docs],total=money_round(sum(d['total'] for d in docs)),

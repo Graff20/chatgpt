@@ -167,7 +167,8 @@ class WorkflowTests(unittest.TestCase):
         self.receipt();self.produce();self.order();before=self.state();path=self.store.path
         with closing(self.store.connect()) as c:
             c.execute('DROP TABLE employees');c.execute('DROP TABLE production_jobs')
-            for col in ('labor_rate','overhead_rate','overhead_percent','production_buffer'):c.execute('ALTER TABLE items DROP COLUMN '+col)
+            for col in ('labor_rate','overhead_rate','overhead_percent','production_buffer','portion_weight'):c.execute('ALTER TABLE items DROP COLUMN '+col)
+            for col in ('order_mode','portions','shipped_portions','portion_weight'):c.execute('ALTER TABLE order_lines DROP COLUMN '+col)
             c.execute('ALTER TABLE recipes DROP COLUMN author');c.execute('PRAGMA user_version=2');c.commit()
         upgraded=Store(path);after=upgraded.snapshot()
         for key in ('lots','documents','orders','order_lines'):self.assertEqual(before[key],after[key])

@@ -54,21 +54,21 @@ class WorkflowMixin:
 
     def allocate_orders(self,c,exclude_order=None):
         """Allocate each lot once, FEFO, by promised delivery time (including completed portions)."""
-        from domain import EPS
+        from domain import EPS,remaining_quantity,remaining_portions
         now=datetime.now().isoformat(timespec='minutes')
         lots=[dict(r) for r in c.execute("SELECT * FROM lots WHERE qty>? AND blocked=0 AND produced<=? ORDER BY CASE WHEN expires='' THEN '9999' ELSE expires END,id",(EPS,now))]
         result=[]
         orders=c.execute("SELECT l.*,o.due,o.client_id,o.driver_id,o.manager FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE o.status='open' ORDER BY o.due,o.id,l.id").fetchall()
         for row in orders:
             if exclude_order and row['order_id']==int(exclude_order):continue
-            remaining=max(0,row['qty']-row['shipped']);needed=remaining;chosen=[]
+            remaining=remaining_quantity(row);needed=remaining;chosen=[]
             for lot in lots:
                 if lot['item_id']!=row['item_id'] or (lot['expires'] and lot['expires']<=max(row['due'],now)):continue
                 take=min(needed,lot['qty'])
                 if take>EPS:
                     lot['qty']-=take;needed-=take;chosen.append({'lot_id':lot['id'],'code':lot['code'],'qty':take})
                 if needed<=EPS:break
-            result.append(dict(order_id=row['order_id'],line_id=row['id'],item_id=row['item_id'],due=row['due'],client_id=row['client_id'],driver_id=row['driver_id'],manager=row['manager'],ordered=row['qty'],shipped=row['shipped'],remaining=remaining,covered=remaining-needed,shortage=max(0,needed),lots=chosen))
+            result.append(dict(order_id=row['order_id'],line_id=row['id'],item_id=row['item_id'],due=row['due'],client_id=row['client_id'],driver_id=row['driver_id'],manager=row['manager'],ordered=row['qty'],shipped=row['shipped'],remaining=remaining,order_mode=row['order_mode'],portions=row['portions'],shipped_portions=row['shipped_portions'],remaining_portions=remaining_portions(row),portion_weight=row['portion_weight'],covered=remaining-needed,shortage=max(0,needed),lots=chosen))
         return result
 
     def production_plan(self,due):
@@ -91,7 +91,7 @@ class WorkflowMixin:
                 prior=sum(a['remaining'] for a in alloc if a['due'][:10]<due and a['item_id']==iid)
                 available=c.execute("SELECT coalesce(sum(qty),0) FROM lots WHERE item_id=? AND blocked=0 AND produced<=? AND (expires='' OR expires>?)",(iid,datetime.now().isoformat(timespec='minutes'),due+'T23:59')).fetchone()[0]
                 totals=c.execute("SELECT coalesce(sum(l.qty),0),coalesce(sum(l.shipped),0) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE substr(o.due,1,10)=? AND o.status NOT IN ('closed','deleted') AND l.item_id=?",(due,iid)).fetchone()
-                rows.append(dict(item_id=iid,name=item['name'],unit=item['unit'],ordered=ordered,shipped=totals[1],total_ordered=totals[0],available=available,covered=covered,free=covered,prior_demand=prior,produce=target,shortage=need,buffer=item['production_buffer'],error=error))
+                rows.append(dict(item_id=iid,name=item['name'],unit=item['unit'],ordered=ordered,remaining_portions=sum(a['remaining_portions'] for a in lines),shipped=totals[1],total_ordered=totals[0],available=available,covered=covered,free=covered,prior_demand=prior,produce=target,shortage=need,buffer=item['production_buffer'],error=error))
             inputs=[];now=datetime.now().isoformat(timespec='minutes')
             for iid,qty in ingredients.items():
                 item=self.one(c,'items',iid)
@@ -133,7 +133,7 @@ class WorkflowMixin:
                 return job['id']
             if c.execute("SELECT 1 FROM production_jobs WHERE date=? AND status='active'",(dt,)).fetchone():raise ValidationError('На дату уже есть наряд в работе. Закройте его перед созданием нового')
             plan=self.production_plan(dt)
-            products=[dict(item_id=r['item_id'],name=r['name'],unit=r['unit'],qty=r['produce']) for r in plan['products'] if r['produce']>1e-7]
+            products=[dict(item_id=r['item_id'],name=r['name'],unit=r['unit'],qty=r['produce'],portions=r.get('remaining_portions',0)) for r in plan['products'] if r['produce']>1e-7]
             if not products:raise ValidationError('Нет потребности в производстве')
             if any(r['error'] for r in plan['products']):raise ValidationError('Для всех товаров наряда нужны корректные ТТК')
             return c.execute('INSERT INTO production_jobs(date,responsible,products,created) VALUES(?,?,?,?)',(dt,who,dumps(products),datetime.now().isoformat())).lastrowid
@@ -202,7 +202,7 @@ class WorkflowMixin:
 
     def expense_details(self,c,d,amount):
         from domain import required,ValidationError,money_round,day
-        data={'category':required(d.get('category'),'Статья расхода'),'allocations':[]}
+        data={'category':required(d.get('category'),'Статья расхода'),'allocations':[],'purpose':str(d.get('purpose') or d.get('note') or '').strip(),'recipient':str(d.get('recipient') or '').strip()}
         if data['category'].strip().lower()=='зарплата' and not d.get('employee_id'):raise ValidationError('Для выплаты зарплаты выберите сотрудника: начисление уже включено в себестоимость')
         if d.get('employee_id'):
             person=self.one(c,'employees',d['employee_id']);accrued=0;paid=0;reversed_ids=self.reversed_ids(c)
