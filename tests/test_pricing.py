@@ -56,7 +56,7 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(self.quote(lid,i)['price'],170)
         h=object.__new__(Handler);h.server=type('Server',(),{'store':self.store})()
         title,rows=h.export_rows(self.state(),'prices',{})
-        row=next(r for r in rows if 'Десерт новый' in r);self.assertEqual(row[1:3],['Десерт новый','уп.']);self.assertIn(['Папка: Кондитерская/Десерты'],rows);self.assertIn(['Категория: Муссы'],rows)
+        row=next(r for r in rows if 'Десерт новый' in r);self.assertEqual(row[1:3],['Десерт новый','уп.']);self.assertIn(['Папка: Кондитерская / Десерты'],rows);self.assertIn(['Категория: Муссы'],rows)
         self.assertFalse(any('Филе' in r for r in rows)) # raw ingredient excluded
     def test_bulk_skips_exceptions_and_only_selected_products(self):
         lid=self.column();other=self.item('Другое','finished',sale_price=100)
@@ -137,7 +137,7 @@ class PricingHttpTests(unittest.TestCase):
                     text=' '.join(ET.fromstring(xml).itertext())
                     if fmt=='docx':self.assertIn(b'gridSpan',xml)
             else:text=raw.decode('utf-8-sig')
-            for value in ('Прайс-лист','ООО Кухня',date.today().strftime('%d.%m.%Y'),'Папка: Кулинария/Сувид','Категория: Птица','Дистрибьютор','Филе сувид'):
+            for value in ('Прайс-лист','ООО Кухня',date.today().strftime('%d.%m.%Y'),'Папка: Кулинария / Сувид','Категория: Птица','Дистрибьютор','Филе сувид'):
                 self.assertIn(value,text)
             self.assertIn('777,25' if fmt in ('html','docx') else '777.25',text)
             if fmt=='html':self.assertIn('colspan="5"',text);self.assertIn('<thead>',text)
@@ -145,6 +145,30 @@ class PricingHttpTests(unittest.TestCase):
         for key in ('items','partners','recipes','lots','orders','order_lines','documents','pricing'):self.assertEqual(before[key],after[key])
         # Purchasing analytics still exports purchase prices, independently of sale-price columns.
         text=self.request('/api/export?type=purchase_prices&format=html')[1].decode();self.assertIn('История закупочных цен',text);self.assertNotIn('Дистрибьютор',text)
+
+    def test_folder_variants_form_one_section_in_every_format_without_empty_category(self):
+        import io,zipfile,xml.etree.ElementTree as ET
+        folders=['Бисквитные палочки',' Бисквитные  палочки\u00a0','БИСКВИТНЫЕ ПАЛОЧКИ\u200b']
+        for n,folder in enumerate(folders,1):self.request('/api/items',dict(name='Палочки '+str(n),kind='finished',unit='уп.',folder=folder,category=' ' if n==2 else '',sale_price=200+n))
+        before=self.server.store.snapshot()
+        for fmt in ('html','docx','xlsx','csv','json'):
+            _,raw,_=self.request('/api/export?type=prices&format='+fmt)
+            if fmt in ('docx','xlsx'):
+                with zipfile.ZipFile(io.BytesIO(raw)) as z:text=' '.join(ET.fromstring(z.read('word/document.xml' if fmt=='docx' else 'xl/worksheets/sheet1.xml')).itertext())
+            else:text=raw.decode('utf-8-sig')
+            self.assertEqual(text.count('Папка: Бисквитные палочки'),1)
+            self.assertNotIn('Категория:',text);self.assertNotIn('Без категории',text)
+            for n in range(1,4):self.assertIn('Палочки '+str(n),text);self.assertIn(str(200+n),text)
+        after=self.server.store.snapshot()
+        for key in ('items','pricing','documents','lots'):self.assertEqual(before[key],after[key])
+    def test_folder_paths_and_named_categories_normalize_without_merging_other_paths(self):
+        from exports import price_list_table
+        for n,(folder,category) in enumerate([('Кулинария / Сувид','Курица'),(' кулинария/ СУВИД ',' КУРИЦА\u00a0'),('Кулинария/Запекание','Курица')]):
+            self.request('/api/items',dict(name='Филе '+str(n),kind='finished',unit='кг',folder=folder,category=category,sale_price=800))
+        _,rows=price_list_table(self.server.store.snapshot())
+        self.assertEqual(sum(r==['Папка: Кулинария / Сувид'] for r in rows),1)
+        self.assertEqual(sum(r==['Папка: Кулинария / Запекание'] for r in rows),1)
+        self.assertEqual(sum(r==['Категория: Курица'] for r in rows),2)
 
     def test_genuine_v4_restore_upgrades_without_changing_source(self):
         import base64,hashlib,tempfile

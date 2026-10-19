@@ -210,13 +210,25 @@ def price_list_table(state,column_ids=None):
     for key,label in [('inn','ИНН'),('address','Адрес'),('phone','Телефон')]:
         if company.get(key):rows.append([label,company[key]])
     rows += [['Дата',date.today().strftime('%d.%m.%Y')],[],['№','Наименование','Ед.']+[c['name'] for c in columns]]
-    products=sorted((i for i in state['items'] if i['kind']=='finished' and i['mode']=='stock' and i['active']),key=lambda i:(i['folder'].casefold(),i['category'].casefold(),i['name'].casefold()))
+    import unicodedata
+    def label(value):
+        return ' '.join(unicodedata.normalize('NFC',str(value or '')).replace('\u200b','').replace('\ufeff','').split())
+    folders={};categories={};products=[]
+    for i in sorted(state['items'],key=lambda i:i['id']):
+        if i['kind']!='finished' or i['mode']!='stock' or not i['active']:continue
+        path=tuple(part for part in (label(p) for p in i['folder'].split('/')) if part)
+        folder_key=tuple(p.casefold() for p in path);category_name=label(i['category']);category_key=category_name.casefold()
+        folders.setdefault(folder_key,' / '.join(path) or 'Без папки')
+        categories.setdefault((folder_key,category_key),category_name)
+        products.append((folder_key,category_key,i))
+    products.sort(key=lambda r:(r[0],r[1],r[2]['name'].casefold(),r[2]['id']))
     folder=category=None
-    for n,i in enumerate(products,1):
-        if folder!=i['folder']:
-            folder=i['folder'];category=None;rows.append(['Папка: '+(folder or 'Без папки')])
-        if category!=i['category']:
-            category=i['category'];rows.append(['Категория: '+(category or 'Без категории')])
+    for n,(folder_key,category_key,i) in enumerate(products,1):
+        if folder!=folder_key:
+            folder=folder_key;category=None;rows.append(['Папка: '+folders[folder_key]])
+        if category!=category_key:
+            category=category_key
+            if category_key:rows.append(['Категория: '+categories[(folder_key,category_key)]])
         rows.append([n,i['name'],i['unit']]+[cells[(c['id'],i['id'])]['price'] if cells[(c['id'],i['id'])]['price'] is not None else cells[(c['id'],i['id'])]['reason'] for c in columns])
     return 'Прайс-лист',rows
 

@@ -23,7 +23,7 @@ ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.5.2'
+APP_VERSION='0.5.3'
 
 ASSETS=('index.html','app.js','pricing.js','style.css')
 
