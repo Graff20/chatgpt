@@ -79,6 +79,7 @@ class PortionFinanceTests(unittest.TestCase):
         self.receipt();self.produce();oid=self.store.save_order({'client_id':self.client,'manager':'М','due':self.future,'lines':[{'item_id':self.product,'qty':2,'price':800}]})
         before=self.state()
         with self.store.transaction() as c:
+            c.execute('ALTER TABLE items DROP COLUMN supply_type')
             c.execute('ALTER TABLE partners DROP COLUMN price_list_id')
             c.execute('ALTER TABLE orders DROP COLUMN price_list_id')
             c.execute('ALTER TABLE order_lines DROP COLUMN price_origin')
@@ -146,6 +147,7 @@ class LegacyPortionRestoreTests(unittest.TestCase):
         from demo import create_demo
         store=create_demo(Path(self.tmp.name)/'old.sqlite3');before=store.snapshot()
         with store.transaction() as c:
+            c.execute('ALTER TABLE items DROP COLUMN supply_type')
             c.execute('ALTER TABLE partners DROP COLUMN price_list_id')
             c.execute('ALTER TABLE orders DROP COLUMN price_list_id')
             c.execute('ALTER TABLE order_lines DROP COLUMN price_origin')

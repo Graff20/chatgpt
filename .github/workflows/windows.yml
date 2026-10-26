@@ -17,7 +17,7 @@ jobs:
       - name: Accounting and HTTP tests
         run: python -m unittest discover -s tests -v
       - name: Compile
-        run: python -m py_compile app.py domain.py workflow.py adjustments.py pricing.py exports.py demo.py
+        run: python -m py_compile app.py domain.py workflow.py adjustments.py pricing.py network.py exports.py demo.py
       - name: Build portable Windows application
         run: |
           python -m pip install pyinstaller==6.16.0
@@ -31,7 +31,7 @@ jobs:
             for ($attempt = 0; $attempt -lt 20; $attempt++) {
               try {
                 $state = Invoke-RestMethod http://127.0.0.1:18765/api/state
-                if ($state.schema_version -eq 5) { $ready = $true; break }
+                if ($state.schema_version -eq 6) { $ready = $true; break }
               } catch { Start-Sleep -Seconds 1 }
             }
             if (-not $ready) { throw 'Packaged application failed readiness check' }

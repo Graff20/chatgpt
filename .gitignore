@@ -8,3 +8,11 @@ build/
 *.spec
 
 /diagnostics.txt
+
+*.jks
+*.keystore
+*password*.txt
+connection.json
+/private/
+
+*.idsig

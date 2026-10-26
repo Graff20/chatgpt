@@ -90,6 +90,7 @@ class PricingTests(unittest.TestCase):
     def test_v4_upgrade_preserves_legacy_prices_stock_and_documents(self):
         self.receipt();self.produce();self.order(price=750);before=self.state();path=self.store.path
         with self.store.transaction() as c:
+            c.execute('ALTER TABLE items DROP COLUMN supply_type')
             c.execute('ALTER TABLE partners DROP COLUMN price_list_id');c.execute('ALTER TABLE orders DROP COLUMN price_list_id');c.execute('ALTER TABLE order_lines DROP COLUMN price_origin')
             c.execute('DROP TABLE price_values');c.execute('DROP TABLE price_history');c.execute('DROP TABLE price_lists');c.execute('PRAGMA user_version=4')
         store=Store(path);after=store.snapshot();self.assertEqual(after['schema_version'],SCHEMA_VERSION)
@@ -176,6 +177,7 @@ class PricingHttpTests(unittest.TestCase):
         from demo import create_demo
         store=create_demo(Path(self.tmp.name)/'v4.sqlite3');before=store.snapshot()
         with store.transaction() as c:
+            c.execute('ALTER TABLE items DROP COLUMN supply_type')
             c.execute('ALTER TABLE partners DROP COLUMN price_list_id');c.execute('ALTER TABLE orders DROP COLUMN price_list_id');c.execute('ALTER TABLE order_lines DROP COLUMN price_origin')
             c.execute('DROP TABLE price_values');c.execute('DROP TABLE price_history');c.execute('DROP TABLE price_lists');c.execute('PRAGMA user_version=4')
         with closing(store.connect()) as c:c.execute('PRAGMA wal_checkpoint(TRUNCATE)')

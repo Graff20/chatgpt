@@ -1,0 +1,57 @@
+name: Windows clients and server
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-desktop.txt
+      - name: Build native desktop client
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name CehClient desktop.py
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc="${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc windows/client.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
+          $hash=(Get-FileHash dist/installers/CehClientSetup.exe -Algorithm SHA256).Hash.ToLower()
+          @{version='0.6.0';sha256=$hash} | ConvertTo-Json | Set-Content dist/installers/CehClientSetup.exe.json -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ceh-Windows-Installer
+          path: |
+            dist/installers/CehClientSetup.exe
+            dist/installers/CehClientSetup.exe.json
+  shared-server:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pyinstaller==6.16.0
+      - run: python -m unittest discover -s tests -q
+      - run: python -m PyInstaller --noconfirm --clean --onedir --name CehServer --add-data "static;static" app.py
+      - run: python -m PyInstaller --noconfirm --clean --onedir --name CehAdmin manage.py
+      - name: Assemble server installer package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bundle/dist/CehServer,bundle/windows,bundle/docs | Out-Null
+          Copy-Item dist/CehServer/* bundle/dist/CehServer/ -Recurse -Force
+          Copy-Item dist/CehAdmin/* bundle/dist/CehServer/ -Recurse -Force
+          Copy-Item windows/*.ps1 bundle/windows/
+          Copy-Item windows/*.cmd bundle/windows/
+          Copy-Item docs/SHARED-SERVER.md bundle/docs/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ceh-Server-Windows
+          path: bundle/

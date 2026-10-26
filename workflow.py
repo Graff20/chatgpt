@@ -76,11 +76,13 @@ class WorkflowMixin:
         due=day(due)
         with closing(self.connect()) as c:
             c.execute('BEGIN')
-            alloc=self.allocate_orders(c); rows=[];ingredients={}
+            alloc=self.allocate_orders(c); rows=[];purchases=[];ingredients={}
             ids=sorted({a['item_id'] for a in alloc if a['due'][:10]==due} | {r[0] for r in c.execute("SELECT DISTINCT l.item_id FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE substr(o.due,1,10)=? AND o.status NOT IN ('closed','deleted')",(due,))})
             for iid in ids:
                 item=self.one(c,'items',iid);lines=[a for a in alloc if a['due'][:10]==due and a['item_id']==iid]
                 ordered=sum(a['remaining'] for a in lines);covered=sum(a['covered'] for a in lines);need=sum(a['shortage'] for a in lines)
+                if item['supply_type']=='resale':
+                    purchases.append(dict(item_id=iid,name=item['name'],unit=item['unit'],ordered=ordered,covered=covered,shortage=need,purchase=need));continue
                 target=need*(1+item['production_buffer']/100)
                 if item['unit'] in ('шт.','уп.'):target=math.ceil(target-EPS)
                 error=''
@@ -113,7 +115,7 @@ class WorkflowMixin:
                             job['progress'].append(dict(item_id=live['item_id'],name=live['name'],unit=live['unit'],qty=0,produced=0,remaining=0,current=live['produce'],change=live['produce']))
                 job['revisions']=json.loads(job['revisions'])
                 jobs.append(job)
-            return dict(date=due,products=rows,ingredients=inputs,orders=[a for a in alloc if a['due'][:10]==due],jobs=jobs,prior_uncovered=[a for a in alloc if a['due'][:10]<due and a['shortage']>EPS])
+            return dict(date=due,products=rows,purchases=purchases,ingredients=inputs,orders=[a for a in alloc if a['due'][:10]==due],jobs=jobs,prior_uncovered=[a for a in alloc if a['due'][:10]<due and a['shortage']>EPS])
 
     def save_job(self,d):
         from domain import day,required,dumps,ValidationError

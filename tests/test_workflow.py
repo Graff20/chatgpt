@@ -166,6 +166,7 @@ class WorkflowTests(unittest.TestCase):
     def test_v2_upgrade_preserves_lots_orders_docs_and_backup(self):
         self.receipt();self.produce();self.order();before=self.state();path=self.store.path
         with closing(self.store.connect()) as c:
+            c.execute('ALTER TABLE items DROP COLUMN supply_type')
             c.execute('ALTER TABLE partners DROP COLUMN price_list_id')
             c.execute('ALTER TABLE orders DROP COLUMN price_list_id')
             c.execute('ALTER TABLE order_lines DROP COLUMN price_origin')

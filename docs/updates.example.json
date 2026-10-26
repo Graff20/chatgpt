@@ -1,0 +1,4 @@
+{
+  "android": {"latest": 1, "minimum": 1, "url": "https://your-download-host.example/ceh-1.apk", "sha256": "REPLACE_WITH_ACTUAL_64_CHARACTER_SHA256"},
+  "windows": {"latest": "0.6.0", "minimum": "0.6.0", "url": "https://your-download-host.example/CehClientSetup.exe", "sha256": "REPLACE_WITH_ACTUAL_64_CHARACTER_SHA256"}
+}

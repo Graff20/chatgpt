@@ -1,5 +1,7 @@
 """Local HTTP application, Windows/Linux. Start: python app.py --open."""
 import argparse
+from http.cookies import SimpleCookie
+from network import Network
 import base64
 import hashlib
 import json
@@ -23,9 +25,9 @@ ROOT=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
 DATA_ROOT=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
 LOCK=threading.RLock()
 MAX_BODY=64*1024*1024
-APP_VERSION='0.5.3'
+APP_VERSION='0.6.0'
 
-ASSETS=('index.html','app.js','pricing.js','style.css')
+ASSETS=('index.html','app.js','pricing.js','style.css','login.html','login.js','mobile.html','mobile.js','mobile.css','session.js')
 
 def check_assets():
     missing=[]
@@ -58,6 +60,8 @@ class Handler(BaseHTTPRequestHandler):
     @property
     def store(self): return self.server.store
     def send(self,status,data,ctype='application/json; charset=utf-8',filename=None):
+        if getattr(self,'_defer_response',False):
+            self._pending_response=(status,data,ctype,filename);return
         if not isinstance(data,bytes): data=dumps(data).encode()
         self.send_response(status)
         self.send_header('Content-Type',ctype)
@@ -66,23 +70,78 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('X-Frame-Options','SAMEORIGIN')
         self.send_header('Referrer-Policy','same-origin')
+        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'")
+        if getattr(self,'session_cookie',None):self.send_header('Set-Cookie',self.session_cookie)
         if filename: self.send_header('Content-Disposition',f'attachment; filename="{filename}"')
         self.end_headers(); self.wfile.write(data)
     def do_GET(self):
+        self._defer_response=False;self._pending_response=None
         try:
-            with LOCK: self.get()
+            if urlparse(self.path).path.startswith('/downloads/'):return self.download_update()
+            self._defer_response=True
+            try:
+                with LOCK:self.get()
+            finally:self._defer_response=False
+            # A slow mobile download must not hold the accounting lock.
+            if self._pending_response:self.send(*self._pending_response)
+        except PermissionError as e:self.send(403,{'error':str(e)})
         except (ValidationError,ValueError,KeyError) as e: self.send(400,{'error':str(e)})
         except (BrokenPipeError,ConnectionResetError): pass
         except Exception:
             traceback.print_exc(); self.send(500,{'error':'Ошибка сервера. Подробности в окне запуска.'})
+    def download_update(self):
+        import re
+        name=urlparse(self.path).path.removeprefix('/downloads/')
+        if not re.fullmatch(r'(ceh-android-[0-9]+\.apk|CehClientSetup-[0-9]+\.[0-9]+\.[0-9]+\.exe)',name):return self.send(404,{'error':'Файл не найден'})
+        folder=(self.server.data/'updates').resolve();path=folder/name
+        if path.resolve().parent!=folder or not path.is_file():return self.send(404,{'error':'Обновление ещё не опубликовано'})
+        # Software downloads never hold the accounting lock or open database files.
+        with path.open('rb') as stream:
+            size=os.fstat(stream.fileno()).st_size
+            self.send_response(200);self.send_header('Content-Type','application/vnd.android.package-archive' if name.endswith('.apk') else 'application/octet-stream');self.send_header('Content-Length',str(size));self.send_header('Content-Disposition','attachment; filename="'+name+'"');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Cache-Control','no-store');self.end_headers()
+            while True:
+                block=stream.read(65536)
+                if not block:break
+                self.wfile.write(block)
+
+    def token(self):
+        cookie=SimpleCookie()
+        try:cookie.load(self.headers.get('Cookie',''))
+        except Exception:return ''
+        return cookie['ceh_session'].value if 'ceh_session' in cookie else ''
+    def current_user(self):
+        user=self.server.network.authenticate(self.token()) if self.server.network else None
+        if not user:return None
+        return user
     def get(self):
         u=urlparse(self.path); q=parse_qs(u.query); path=u.path
         column_query=parse_qs(u.query,keep_blank_values=True)
         if 'price_columns' in column_query:q['price_columns']=column_query['price_columns']
+        if path=='/api/client-version':
+            updates={'server':'0.6.0','android':{'latest':1,'minimum':1},'windows':{'latest':'0.6.0','minimum':'0.6.0'}}
+            manifest=self.server.data/'updates.json'
+            if manifest.exists():
+                configured=json.loads(manifest.read_text(encoding='utf-8-sig'))
+                for key in ('android','windows'):
+                    if key in configured:updates[key]={k:v for k,v in configured[key].items() if k in ('latest','minimum','url','sha256')}
+            return self.send(200,updates)
+        if path=='/api/auth/me':return self.send(200,{'enabled':bool(self.server.network),'user':self.current_user()})
+        if (self.server.data/'maintenance.flag').exists() and path not in ('/api/auth/me','/api/client-version') and path.startswith('/api/'):return self.send(503,{'error':'Плановое обновление сервера. Сохраните черновик и повторите позже'})
+        if self.server.network and path.startswith('/api/'):
+            user=self.current_user()
+            if not user:return self.send(401,{'error':'Войдите под своей учётной записью'})
+            self.server.network.authorize(user,path)
+            if path=='/api/receipt-photo':
+                with closing(self.store.connect()) as c:
+                    photo=c.execute('SELECT mime,image FROM net_photos WHERE id=?',(int(q.get('id',['0'])[0]),)).fetchone()
+                if not photo:return self.send(404,{'error':'Фото не найдено'})
+                return self.send(200,photo['image'],photo['mime'])
+            if path=='/api/mobile/state':return self.send(200,self.server.network.workspace(user))
         if path=='/api/runtime': return self.send(200,self.server.runtime_info())
         if path=='/api/state':
             state=self.store.snapshot()
             state['runtime']=self.server.runtime_info()
+            if self.server.network:state['account']=self.current_user()
             return self.send(200,state)
         if path=='/api/pricing':return self.send(200,self.store.pricing())
         if path=='/api/route': return self.send(200,self.store.route(q.get('date',[date.today().isoformat()])[0],q.get('driver_id',[None])[0]))
@@ -115,8 +174,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200,invoice_html(doc),'text/html; charset=utf-8')
             content,mime=export(title,rows,fmt)
             return self.send(200,content,mime,None if fmt=='html' else 'ceh-export.'+fmt)
-        files={'/':'index.html','/app.js':'app.js','/pricing.js':'pricing.js','/style.css':'style.css'}
+        files={'/session.js':'session.js','/login':'login.html','/login.js':'login.js','/mobile':'mobile.html','/mobile.js':'mobile.js','/mobile.css':'mobile.css','/':'index.html','/app.js':'app.js','/pricing.js':'pricing.js','/style.css':'style.css'}
         if path not in files: return self.send(404,{'error':'Не найдено'})
+        if self.server.network and path=='/' and not self.current_user():return self.send(200,(ROOT/'static'/'login.html').read_bytes(),'text/html; charset=utf-8')
         p=ROOT/'static'/files[path]
         mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8'}[p.suffix]
         try:
@@ -129,6 +189,8 @@ class Handler(BaseHTTPRequestHandler):
     def export_rows(self,state,typ,q):
         items={i['id']:i for i in state['items']}
         ident=int(q.get('id',['0'])[0])
+        if typ=='purchases':
+            plan=self.store.plan(q.get('date',[date.today().isoformat()])[0]);return 'Потребность в закупке готовых товаров',[['Товар','Ед.','Заказано','Обеспечено','Закупить']]+[[r['name'],r['unit'],r['ordered'],r['covered'],r['purchase']] for r in plan['purchases']]
         if typ=='prices':return price_list_table(state,q['price_columns'][0].split(',') if 'price_columns' in q else None)
         if typ=='document':
             doc=next((x for x in state['documents'] if x['id']==ident),None)
@@ -228,6 +290,14 @@ class Handler(BaseHTTPRequestHandler):
             rows += [['Итого начислено, ₽',round(sum(w['amount'] for w in work),2)]]
             return 'Выработка и начисления сотрудникам',rows
         if typ=='debts': return 'Задолженность',[['Клиент','Накладная','Дата','Срок оплаты','Долг, ₽','Просрочен']]+[[d['client'],d['document_id'],d['date'],d['due'],d['amount'],'К оплате сегодня' if d['pending'] else 'Просрочен' if d['overdue'] else 'Долг'] for d in state['debts']]
+        if typ=='sales_origin':
+            groups={'production':['Собственное производство',0,0],'resale':['Перепродажа',0,0]}
+            for doc in state['documents']:
+                if doc['kind'] not in ('shipment','return') or doc['reversed'] or not q.get('from',['0001-01-01'])[0]<=doc['date']<=q.get('to',['9999-12-31'])[0]:continue
+                sign=-1 if doc['kind']=='return' else 1
+                for line in doc['data']['lines']:
+                    r=groups[line.get('supply_type',items[line['item_id']]['supply_type'])];r[1]+=sign*line.get('line_total',line['qty']*line['price']);r[2]+=sign*sum(l['qty']*l['unit_cost'] for l in line['lots'])
+            return 'Продажи по способу поступления',[['Источник товара','Выручка, ₽','Себестоимость продаж, ₽','Валовая прибыль, ₽']]+[[r[0],round(r[1],2),round(r[2],2),round(r[1]-r[2],2)] for r in groups.values()]
         if typ=='analytics':
             start=q.get('from',['0001-01-01'])[0]; end=q.get('to',['9999-12-31'])[0]
             group=q.get('group',['product'])[0]
@@ -259,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             # Reject cross-origin browser requests and non-JSON form submissions.
             origin=self.headers.get('Origin')
-            if origin and urlparse(origin).netloc != self.headers.get('Host'):
+            if origin and urlparse(origin).netloc not in {self.headers.get('Host'),urlparse(getattr(self.server,'public_url','')).netloc}:
                 return self.send(403,{'error':'Запрос с другого сайта запрещён'})
             if self.headers.get_content_type()!='application/json':
                 return self.send(415,{'error':'Требуется JSON'})
@@ -268,16 +338,35 @@ class Handler(BaseHTTPRequestHandler):
             d=json.loads(self.rfile.read(size))
             if not isinstance(d,dict): raise ValidationError('Ожидается объект JSON')
             with LOCK:
+                if (self.server.data/'maintenance.flag').exists() and self.path!='/api/auth/logout':return self.send(503,{'error':'Идёт обновление сервера. Повторите отправку позже с прежними данными'})
+                if self.path=='/api/auth/login':
+                    if not self.server.network:return self.send(400,{'error':'Сначала создайте администратора на серверном ПК'})
+                    token,user=self.server.network.login(d.get('login',''),d.get('password',''))
+                    secure='; Secure' if self.server.public_url.startswith('https:') else ''
+                    self.session_cookie='ceh_session='+token+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200'+secure
+                    return self.send(200,{'user':user})
+                if self.path=='/api/auth/logout':
+                    if self.server.network:self.server.network.logout(self.token())
+                    self.session_cookie='ceh_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0';return self.send(200,{'ok':True})
+                user=self.current_user() if self.server.network else None
+                if self.server.network:
+                    if not user:return self.send(401,{'error':'Требуется вход'})
+                    if self.path=='/api/request-resolve':return self.send(200,self.server.network.resolve_request(user,str(d.get('request_id',''))))
+                    self.server.network.authorize(user,self.path,d)
+                    if self.path.startswith('/api/net/'):
+                        return self.send(200,self.server.network.request(user,self.path,d,self.headers.get('X-Request-ID'),None))
                 if self.path in ('/api/restore','/api/restore-preview'): return self.restore(dict(d,preview=self.path=='/api/restore-preview'))
                 if self.path=='/api/deletion-preview':return self.send(200,self.store.deletion_preview(d))
-                if self.path=='/api/prices':return self.send(200,self.store.edit_prices(d))
+                if self.path=='/api/prices':return self.send(200,self.server.network.request(user,self.path,d,self.headers.get('X-Request-ID'),self.store.edit_prices) if self.server.network else self.store.edit_prices(d))
                 actions={'/api/delete-document':self.store.delete_document,'/api/delete-order':self.store.delete_order,'/api/dispatch-summary':self.store.dispatch_summary,'/api/recalculate':self.store.recalculate,'/api/production-workers':self.store.update_production_workers,'/api/employees':self.store.save_employee,'/api/jobs':self.store.save_job,'/api/exchange':self.store.exchange,'/api/refund':self.store.refund,'/api/drivers':self.store.save_driver,'/api/company':self.store.save_company,'/api/assign-delivery':self.store.assign_delivery,'/api/close-day':self.store.close_day,'/api/reverse':self.store.reverse,'/api/return':self.store.customer_return,'/api/release':self.store.release_lot,'/api/items':self.store.save_item,'/api/partners':self.store.save_partner,'/api/recipes':self.store.save_recipe,
                     '/api/receipt':self.store.receipt,'/api/production':self.store.production,'/api/orders':self.store.save_order,
                     '/api/close-order':self.store.close_order,'/api/shipment':self.store.shipment,'/api/money':self.store.money,
                     '/api/writeoff':self.store.writeoff,'/api/inventory':self.store.inventory}
                 action=actions.get(self.path)
                 if not action: return self.send(404,{'error':'Не найдено'})
+                if self.server.network:return self.send(200,self.server.network.request(user,self.path,d,self.headers.get('X-Request-ID'),action))
                 self.send(200,{'id':action(d)})
+        except PermissionError as e:self.send(403,{'error':str(e)})
         except sqlite3.IntegrityError as e:
             self.send(400,{'error':'Проверьте уникальность наименования и связи справочников.'})
         except (ValidationError,ValueError,TypeError,KeyError) as e: self.send(400,{'error':str(e)})
@@ -289,6 +378,18 @@ class Handler(BaseHTTPRequestHandler):
         if not raw.startswith(b'SQLite format 3\x00'): raise ValidationError('Это не резервная копия SQLite')
         digest=hashlib.sha256(raw).hexdigest()
         if d.get('expected_sha256') and d['expected_sha256']!=digest: raise ValidationError('Файл отличается от проверенной копии. Выберите его заново')
+        request_id=self.headers.get('X-Request-ID','')
+        if self.server.network and not d.get('preview'):
+            if not request_id:raise ValidationError('Для восстановления нужен идентификатор операции')
+            with closing(self.store.connect()) as c:
+                cancelled=c.execute("SELECT 1 FROM net_requests WHERE user_id=? AND request_id=? AND path='cancelled'",(self.current_user()['id'],request_id)).fetchone()
+                if cancelled:raise ValidationError('Прежняя отправка восстановления была отменена')
+                previous=c.execute("SELECT value FROM settings WHERE key='last_restore'").fetchone()
+            marker=json.loads(previous['value']) if previous else {}
+            if marker.get('request_id')==request_id:
+                if marker.get('digest')!=digest:raise ValidationError('Идентификатор восстановления использован для другой копии')
+                with closing(self.store.connect()) as c:counts={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('items','partners','recipes','lots','orders','documents','drivers','employees','production_jobs')}
+                return self.send(200,{'ok':True,'counts':counts,'database_path':str(self.store.path.resolve()),'replayed':True})
         fd,staged=tempfile.mkstemp(prefix='restore-candidate-',suffix='.sqlite3',dir=self.server.data)
         temp=Path(staged)
         with os.fdopen(fd,'wb') as stream: stream.write(raw)
@@ -296,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
             with closing(sqlite3.connect(f'file:{temp.as_posix()}?mode=ro',uri=True)) as c:
                 c.execute('PRAGMA trusted_schema=OFF')
                 if c.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise ValidationError('Повреждённая база')
-                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,2,3,4,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
+                if c.execute('PRAGMA user_version').fetchone()[0] not in (1,2,3,4,5,SCHEMA_VERSION): raise ValidationError('Неподдерживаемая версия базы')
                 for table in ('items','partners','lots','movements','recipes','documents','orders','order_lines'):
                     if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone(): raise ValidationError('Неверная структура базы')
                 if c.execute('PRAGMA foreign_key_check').fetchone(): raise ValidationError('Повреждены связи базы')
@@ -312,7 +413,14 @@ class Handler(BaseHTTPRequestHandler):
             if d.get('require_nonempty') and not any(source_counts.values()):
                 raise ValidationError('Выбранная копия пустая: в ней нет карточек и документов. Рабочая база не заменена. Выберите прежнюю копию с записями')
             candidate=Store(temp)
+            if self.server.network and not Network.enabled(candidate):raise ValidationError('Сетевая копия должна содержать учётные записи. Для старой базы используйте перенос при остановленном сервере')
+            if Network.enabled(candidate):Network.validate(candidate)
             candidate.snapshot()  # Validate required columns and JSON before touching live data.
+            if Network.enabled(candidate):
+                with candidate.transaction() as c:
+                    c.execute('DELETE FROM net_sessions')
+                    c.execute("INSERT INTO net_audit(at,user_id,action,entity) VALUES(?,NULL,'restore',?)",(datetime.now().isoformat(),digest))
+                    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('last_restore',?)",(dumps({'request_id':request_id,'digest':digest}),))
             with closing(candidate.connect()) as c:
                 c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
                 c.execute('PRAGMA journal_mode=DELETE')
@@ -322,16 +430,18 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('PRAGMA journal_mode=DELETE')
             os.replace(temp,self.store.path)
             self.server.store=Store(self.store.path)
+            self.server.network=Network(self.server.store) if Network.enabled(self.server.store) else None
             with closing(self.store.connect()) as c:
                 counts={t:c.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in tables+('drivers','employees','production_jobs')}
-            self.send(200,{'ok':True,'counts':counts,'database_path':str(self.store.path.resolve())})
+            self.send(200,{'ok':True,'counts':counts,'database_path':str(self.store.path.resolve()),'reauth_required':bool(self.server.network)})
         finally:
             for suffix in ('','-wal','-shm'):
                 Path(str(temp)+suffix).unlink(missing_ok=True)
 
 class Server(ThreadingHTTPServer):
     daemon_threads=True
-    def __init__(self,address,data):
+    def __init__(self,address,data,secure=False,public_url=''):
+        self.public_url=public_url
         check_assets()
         self.data=Path(data).resolve()
         self.started_at=datetime.now().isoformat(timespec='seconds')
@@ -341,6 +451,8 @@ class Server(ThreadingHTTPServer):
             self.server_bind()
             self.data.mkdir(parents=True,exist_ok=True)
             self.store=Store(self.data/'ceh.sqlite3')
+            self.network=Network(self.store) if secure or Network.enabled(self.store) else None
+            if self.network and not self.network.users():raise ValidationError('Создайте администратора: python manage.py init-admin --data '+str(self.data))
             (self.data/'backups').mkdir(exist_ok=True)
             self.backup(self.data/'backups'/f'start-{date.today().isoformat()}.sqlite3',replace=False)
             self.server_activate()
@@ -360,9 +472,20 @@ def main():
     p=argparse.ArgumentParser(description='Цех — учёт производства')
     p.add_argument('--host',default='127.0.0.1'); p.add_argument('--port',type=int,default=8765)
     p.add_argument('--data',default=str(DATA_ROOT/'data')); p.add_argument('--open',action='store_true')
+    p.add_argument('--secure',action='store_true');p.add_argument('--public-url',default='');p.add_argument('--log-file')
     args=p.parse_args()
+    if args.log_file:
+        import logging
+        from logging.handlers import RotatingFileHandler
+        target=Path(args.log_file);target.parent.mkdir(parents=True,exist_ok=True)
+        logger=logging.getLogger('ceh');logger.setLevel(logging.INFO);logger.addHandler(RotatingFileHandler(target,maxBytes=5*1024*1024,backupCount=5,encoding='utf-8'))
+        class LogStream:
+            def write(self,message):
+                if message.strip():logger.info(message.rstrip())
+            def flush(self):pass
+        sys.stdout=LogStream();sys.stderr=LogStream()
     try:
-        server=Server((args.host,args.port),args.data)
+        server=Server((args.host,args.port),args.data,args.secure,args.public_url)
     except ValidationError as e:
         print('Запуск отменён:',e)
         return 1

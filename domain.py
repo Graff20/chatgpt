@@ -2,12 +2,13 @@
 import sqlite3
 import json
 import math
+import threading
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from contextlib import contextmanager, closing
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 EPS = 1e-7
 
 def money_round(value):
@@ -116,6 +117,7 @@ from pricing import PricingMixin
 
 class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
     def __init__(self, path):
+        self._tx_local=threading.local()
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self.connect()) as c:
@@ -178,6 +180,12 @@ class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
                     ALTER TABLE order_lines ADD COLUMN price_origin TEXT NOT NULL DEFAULT 'saved';
                     PRAGMA user_version=5; COMMIT;""")
                 version=5
+            if version == 5:
+                backup=self.path.parent/'backups'/f'before-v6-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3'
+                backup.parent.mkdir(exist_ok=True)
+                with closing(sqlite3.connect(backup)) as target:c.backup(target)
+                c.executescript("BEGIN IMMEDIATE; ALTER TABLE items ADD COLUMN supply_type TEXT NOT NULL DEFAULT 'production'; PRAGMA user_version=6; COMMIT;")
+                version=6
             if version != SCHEMA_VERSION:
                 raise ValidationError('Версия базы не поддерживается этим приложением')
 
@@ -193,16 +201,21 @@ class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
 
     @contextmanager
     def transaction(self):
-        c = self.connect()
+        existing=getattr(self._tx_local,'connection',None)
+        if existing is not None:
+            savepoint='nested_'+str(getattr(self._tx_local,'depth',0));self._tx_local.depth=getattr(self._tx_local,'depth',0)+1
+            existing.execute('SAVEPOINT '+savepoint)
+            try:
+                yield existing;existing.execute('RELEASE '+savepoint)
+            except Exception:
+                existing.execute('ROLLBACK TO '+savepoint);existing.execute('RELEASE '+savepoint);raise
+            finally:self._tx_local.depth-=1
+            return
+        c=self.connect();self._tx_local.connection=c
         try:
-            c.execute('BEGIN IMMEDIATE')
-            yield c
-            c.commit()
-        except Exception:
-            c.rollback()
-            raise
-        finally:
-            c.close()
+            c.execute('BEGIN IMMEDIATE');yield c;c.commit()
+        except Exception:c.rollback();raise
+        finally:self._tx_local.connection=None;c.close()
 
     def one(self, c, table, ident):
         # All table names are internal constants, never supplied by HTTP callers.
@@ -253,18 +266,21 @@ class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
             shelf_hours = (number(d['shelf_days'], 'Срок годности, суток') * 24
                            if 'shelf_days' in d else number(d.get('shelf_hours') or 24, 'Срок годности'))
             shelf_hours = number(shelf_hours, 'Срок годности')
+        supply=d.get('supply_type','production')
+        if supply not in ('production','resale') or (supply=='resale' and kind!='finished'):raise ValidationError('Перепродажа доступна только для готового товара')
+        if supply=='resale' and any(number(d.get(k,0),k,False)>0 for k in ('labor_rate','overhead_rate','overhead_percent','production_buffer')):raise ValidationError('У покупного товара нет производственных начислений')
         values = [name, kind, str(d.get('folder', '')), str(d.get('category', '')), unit,
                   number(d.get('minimum', 0), 'Минимум', False), number(d.get('price', 0), 'Цена', False),
                   number(d.get('sale_price', 0), 'Цена продажи', False), shelf_hours,
                   mode, dumps(losses), number(d.get('pack_size', 1), 'Состав упаковки'), str(d.get('notes', '')),
-                  int(bool(d.get('active', True))), int(bool(d.get('track_expiry', True)))]+[number(d.get(k,0),k,False) for k in ('labor_rate','overhead_rate','overhead_percent','production_buffer','portion_weight')]
+                  int(bool(d.get('active', True))), int(bool(d.get('track_expiry', True)))]+[number(d.get(k,0),k,False) for k in ('labor_rate','overhead_rate','overhead_percent','production_buffer','portion_weight')]+[supply]
         if (kind in ('raw','packaging') or mode=='virtual') and any(number(d.get(k,0),k,False)>0 for k in ('labor_rate','overhead_rate','overhead_percent')):
             raise ValidationError('Расценку и производственные расходы задавайте складскому блюду или полуфабрикату; для сырья и виртуального полуфабриката оставьте нули')
-        cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active,track_expiry,labor_rate,overhead_rate,overhead_percent,production_buffer,portion_weight'
+        cols = 'name,kind,folder,category,unit,minimum,price,sale_price,shelf_hours,mode,losses,pack_size,notes,active,track_expiry,labor_rate,overhead_rate,overhead_percent,production_buffer,portion_weight,supply_type'
         with self.transaction() as c:
             if d.get('id'):
                 old = self.one(c, 'items', d['id'])
-                if any(old[k] != dval for k, dval in [('unit', unit), ('kind', kind), ('mode', mode)]):
+                if any(old[k] != dval for k, dval in [('unit', unit), ('kind', kind), ('mode', mode),('supply_type',supply)]):
                     referenced = c.execute('SELECT 1 FROM movements WHERE item_id=? UNION SELECT 1 FROM order_lines WHERE item_id=?', (old['id'], old['id'])).fetchone()
                     in_recipe = any(any(int(x['item_id']) == old['id'] for x in json.loads(r[0])) for r in c.execute('SELECT lines FROM recipes'))
                     if referenced or in_recipe or c.execute('SELECT 1 FROM recipes WHERE item_id=?', (old['id'],)).fetchone():
@@ -311,6 +327,7 @@ class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
     def save_recipe(self, d):
         with self.transaction() as c:
             product = self.one(c, 'items', d.get('item_id'))
+            if product['supply_type']=='resale':raise ValidationError('Покупной товар не требует ТТК')
             if product['kind'] not in ('semi', 'finished'):
                 raise ValidationError('ТТК создаётся для блюда или полуфабриката')
             yield_qty = self.quantity(product, d.get('yield_qty'))
@@ -360,7 +377,7 @@ class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
 
     def planned_cost(self, c, item_id, path=None):
         item = self.one(c, 'items', item_id)
-        if item['kind'] in ('raw', 'packaging'):
+        if item['kind'] in ('raw', 'packaging') or item['supply_type']=='resale':
             # Last receipt by business date, not latest edited item price.
             r = c.execute("SELECT l.unit_cost FROM lots l JOIN documents d ON d.id=l.document_id WHERE l.item_id=? AND d.kind='receipt' AND NOT EXISTS (SELECT 1 FROM documents r WHERE r.kind='reversal' AND json_extract(r.data,'$.target_id')=d.id) ORDER BY d.date DESC,d.id DESC,l.id DESC LIMIT 1",(item_id,)).fetchone()
             return r[0] if r else item['price']
@@ -428,7 +445,7 @@ class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
             lines, total = [],0
             for row in d['lines']:
                 item = self.one(c,'items',row.get('item_id'))
-                if item['kind'] not in ('raw','packaging'):
+                if item['kind'] not in ('raw','packaging') and item['supply_type']!='resale':
                     raise ValidationError('Готовую продукцию и полуфабрикаты приходуйте документом выпуска')
                 q = self.quantity(item,row.get('qty'),row.get('unit'))
                 price = number(row.get('price'),'Цена',False)
@@ -441,6 +458,7 @@ class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
     def production(self, d):
         with self.transaction() as c:
             item = self.one(c,'items',d.get('item_id'))
+            if item['supply_type']=='resale':raise ValidationError('Покупной товар приходуется от поставщика, без выпуска')
             if item['kind'] not in ('finished','semi') or item['mode']=='virtual':
                 raise ValidationError('Выпуск доступен для складского блюда или полуфабриката')
             q = self.quantity(item,d.get('qty'),d.get('unit'))
@@ -601,7 +619,7 @@ class Store(WorkflowMixin, AdjustmentsMixin, PricingMixin):
                 line_total=money_round(Decimal(str(gross_total))*(1-Decimal(str(discount))/100))
                 total += line_total
                 c.execute('UPDATE order_lines SET shipped=shipped+?,shipped_portions=shipped_portions+? WHERE id=?',(q,sent_portions,line['id']))
-                rows.append(dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=q,price=line_total/q,gross_price=line['price'],gross_total=gross_total,line_total=line_total,discount_amount=money_round(gross_total-line_total),lots=lots,line_id=line['id'],order_mode=line['order_mode'],portions=sent_portions,portion_weight=line['portion_weight']))
+                rows.append(dict(item_id=item['id'],name=item['name'],unit=item['unit'],qty=q,price=line_total/q,gross_price=line['price'],gross_total=gross_total,line_total=line_total,discount_amount=money_round(gross_total-line_total),lots=lots,line_id=line['id'],supply_type=item['supply_type'],order_mode=line['order_mode'],portions=sent_portions,portion_weight=line['portion_weight']))
             if not rows:
                 raise ValidationError('Добавьте отгружаемое количество')
             if client['debt_limit'] and self.settled_debt(c,client['id'])>=client['debt_limit']-EPS and not d.get('override_reason'):

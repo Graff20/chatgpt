@@ -1,0 +1,40 @@
+name: Android signed release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install verified Android SDK tools
+        run: python scripts/install_android_sdk.py --sdk /tmp/android-sdk
+      - name: Prepare owner signing key
+        env:
+          CEH_KEYSTORE_B64: ${{ secrets.CEH_ANDROID_KEYSTORE_B64 }}
+          CEH_STORE_PASSWORD: ${{ secrets.CEH_ANDROID_STORE_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os,base64,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          if not os.environ.get('CEH_KEYSTORE_B64') or not os.environ.get('CEH_STORE_PASSWORD'):raise SystemExit('Configure the owner signing secrets before releasing production APKs')
+          (root/'ceh.jks').write_bytes(base64.b64decode(os.environ['CEH_KEYSTORE_B64'],validate=True))
+          (root/'ceh-password.txt').write_text(os.environ['CEH_STORE_PASSWORD'])
+          PY
+      - name: Build and verify APK
+        run: python scripts/build_android.py --sdk /tmp/android-sdk --keystore "$RUNNER_TEMP/ceh.jks" --password-file "$RUNNER_TEMP/ceh-password.txt" --out dist/ceh-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ceh-Android
+          path: |
+            dist/ceh-android.apk
+            dist/ceh-android.apk.sha256
+            dist/ceh-android.apk.json

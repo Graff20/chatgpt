@@ -45,6 +45,7 @@ class PricingMixin:
     def edit_prices(self,d):
         from domain import ValidationError,required,number
         with self.transaction() as c:
+            c.execute('SAVEPOINT price_edit')
             before=self.pricing_state(c)
             if d.get('token')!=before['token']:raise ValidationError('Прайс изменился. Обновите таблицу и повторите предварительный просмотр')
             config=d.get('column');lid=int(d.get('list_id') or (config or {}).get('id') or 0)
@@ -97,8 +98,9 @@ class PricingMixin:
                 old=previous.get((r['list_id'],r['item_id']))
                 if old!=r and r['item_id'] in names:diff.append(dict(item_id=r['item_id'],name=names[r['item_id']],list_name=columns[r['list_id']],old=old,new=r))
             if not d.get('apply'):
-                c.rollback();return dict(list_id=lid,changes=diff,token=before['token'])
+                c.execute('ROLLBACK TO price_edit');c.execute('RELEASE price_edit');return dict(list_id=lid,changes=diff,token=before['token'])
             c.execute('INSERT INTO price_history(created,responsible,changes) VALUES(datetime(\'now\',\'localtime\'),?,?)',(required(d.get('responsible'),'Ответственный'),json.dumps(dict(request=d,changes=diff),ensure_ascii=False)))
+            c.execute('RELEASE price_edit')
             return dict(list_id=lid,changed=len(diff))
 
     def customer_price(self,c,client,item):
