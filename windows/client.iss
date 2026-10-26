@@ -1,4 +1,4 @@
-[Setup]
+﻿[Setup]
 AppId=CehClient
 AppName=Цех — рабочее место
 AppVersion=0.6.0

@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Destination,[string]$InstallDir="$env:ProgramData\CehServer",[string]$DataDir="$env:ProgramData\CehData")
+﻿param([Parameter(Mandatory=$true)][string]$Destination,[string]$InstallDir="$env:ProgramData\CehServer",[string]$DataDir="$env:ProgramData\CehData")
 $ErrorActionPreference='Stop'
 New-Item -ItemType Directory -Force $Destination | Out-Null
 $target=Join-Path $Destination ('ceh-daily-'+(Get-Date -Format 'yyyyMMdd-HHmmss')+'.sqlite3')

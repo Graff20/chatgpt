@@ -1,4 +1,4 @@
-# Run in an elevated PowerShell after unpacking the complete CehServer distribution.
+﻿# Run in an elevated PowerShell after unpacking the complete CehServer distribution.
 param([string]$InstallDir="$env:ProgramData\CehServer",[string]$DataDir="$env:ProgramData\CehData",[string]$PublicUrl="",[string]$DatabaseCopy="")
 $ErrorActionPreference='Stop'
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Запустите PowerShell от имени администратора' }

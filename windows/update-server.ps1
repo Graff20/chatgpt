@@ -1,4 +1,4 @@
-param([string]$InstallDir="$env:ProgramData\CehServer",[string]$DataDir="$env:ProgramData\CehData")
+﻿param([string]$InstallDir="$env:ProgramData\CehServer",[string]$DataDir="$env:ProgramData\CehData")
 $ErrorActionPreference='Stop'
 if (!(Test-Path "$PSScriptRoot\..\dist\CehServer\CehServer.exe")) { throw 'Распакуйте полную новую сборку перед обновлением' }
 $backup=Join-Path $DataDir ('updates\'+(Get-Date -Format 'yyyyMMdd-HHmmss'))

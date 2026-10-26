@@ -1,4 +1,4 @@
-param([string]$DataDir="$env:ProgramData\CehData",[Parameter(Mandatory=$true)][string]$PublicUrl,[string]$AndroidFile="",[string]$WindowsFile="")
+﻿param([string]$DataDir="$env:ProgramData\CehData",[Parameter(Mandatory=$true)][string]$PublicUrl,[string]$AndroidFile="",[string]$WindowsFile="")
 $ErrorActionPreference='Stop'
 $uri=[Uri]$PublicUrl
 if (!$uri.IsAbsoluteUri -or $uri.Scheme -ne 'https' -or $uri.AbsolutePath -ne '/' -or $uri.Query -or $uri.UserInfo) { throw 'Нужен корневой HTTPS-адрес сервера' }
