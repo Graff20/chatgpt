@@ -5,6 +5,8 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+env:
+  PYTHONUTF8: '1'
 jobs:
   windows-client:
     runs-on: windows-latest
@@ -40,8 +42,8 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install pyinstaller==6.16.0
       - run: python scripts/ci_tests.py
-      - run: python -m PyInstaller --noconfirm --clean --onedir --name CehServer --add-data "static;static" app.py
-      - run: python -m PyInstaller --noconfirm --clean --onedir --name CehAdmin manage.py
+      - run: python scripts/ci_step.py Server-build python -m PyInstaller --noconfirm --clean --onedir --name CehServer --add-data "static;static" app.py
+      - run: python scripts/ci_step.py Admin-build python -m PyInstaller --noconfirm --clean --onedir --name CehAdmin manage.py
       - name: Assemble server installer package
         shell: pwsh
         run: |
