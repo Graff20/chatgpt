@@ -44,6 +44,7 @@ jobs:
       - run: python scripts/ci_tests.py
       - run: python scripts/ci_step.py Server-build python -m PyInstaller --noconfirm --clean --onedir --additional-hooks-dir windows/hooks --name CehServer --add-data "static;static" app.py
       - run: python scripts/ci_step.py Admin-build python -m PyInstaller --noconfirm --clean --onedir --additional-hooks-dir windows/hooks --name CehAdmin manage.py
+      - run: python scripts/ci_step.py Frozen-smoke-test python scripts/smoke_frozen.py
       - name: Assemble server installer package
         shell: pwsh
         run: |
