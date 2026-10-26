@@ -475,6 +475,9 @@ class Server(ThreadingHTTPServer):
         with closing(self.store.connect()) as src, closing(sqlite3.connect(target)) as dst: src.backup(dst)
 
 def main():
+    # Frozen Python ignores PYTHONUTF8; redirected Windows consoles may be cp1252.
+    for stream in (sys.stdout,sys.stderr):
+        if hasattr(stream,"reconfigure"):stream.reconfigure(encoding="utf-8",errors="backslashreplace")
     p=argparse.ArgumentParser(description='Цех — учёт производства')
     p.add_argument('--host',default='127.0.0.1'); p.add_argument('--port',type=int,default=8765)
     p.add_argument('--data',default=str(DATA_ROOT/'data')); p.add_argument('--open',action='store_true')

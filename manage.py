@@ -1,5 +1,5 @@
 """Local-only administrator bootstrap and recovery; never exposed as an HTTP endpoint."""
-import argparse,getpass,sqlite3
+import argparse,getpass,sqlite3,sys
 from pathlib import Path
 from contextlib import closing
 from datetime import datetime
@@ -7,6 +7,9 @@ from domain import Store
 from network import Network,password_hash
 
 def main():
+    # Frozen Python ignores PYTHONUTF8; redirected Windows consoles may be cp1252.
+    for stream in (sys.stdout,sys.stderr):
+        if hasattr(stream,"reconfigure"):stream.reconfigure(encoding="utf-8",errors="backslashreplace")
     p=argparse.ArgumentParser();p.add_argument('command',choices=['init-admin','reset-password','backup']);p.add_argument('--data',default='data');p.add_argument('--output');args=p.parse_args()
     path=Path(args.data);store=Store(path/'ceh.sqlite3');target=Path(args.output) if args.output else path/'backups'/('before-access-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'.sqlite3');target.parent.mkdir(exist_ok=True)
     with closing(store.connect()) as src,closing(sqlite3.connect(target)) as dst:src.backup(dst)
