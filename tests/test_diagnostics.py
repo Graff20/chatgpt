@@ -42,7 +42,7 @@ class DiagnosticsTests(unittest.TestCase):
             old=Store(root/'old'/'data'/'ceh.sqlite3');old.save_item({'name':'Секретное название','kind':'raw','unit':'кг'})
             Store(root/'new'/'data'/'ceh.sqlite3')
             report=make_report(root,root/'new')
-            self.assertIn(str(old.path),report)
+            self.assertIn(str(old.path.resolve()),report)
             self.assertIn('ЕСТЬ ЗАПИСИ',report);self.assertIn('ПУСТАЯ БАЗА',report)
             self.assertNotIn('Секретное название',report)
             self.assertEqual(old.snapshot()['items'][0]['name'],'Секретное название')

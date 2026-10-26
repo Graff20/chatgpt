@@ -179,7 +179,10 @@ class WorkflowTests(unittest.TestCase):
         for line in before['order_lines']:line['price_origin']='saved'
         for key in ('lots','documents','orders','order_lines'):self.assertEqual(before[key],after[key])
         backups=list((path.parent/'backups').glob('before-v3-*'));self.assertTrue(backups)
-        self.assertTrue(any(sqlite3.connect(b).execute('PRAGMA user_version').fetchone()[0]==2 for b in backups))
+        versions=[]
+        for backup in backups:
+            with closing(sqlite3.connect(backup)) as c:versions.append(c.execute('PRAGMA user_version').fetchone()[0])
+        self.assertIn(2,versions)
         self.assertEqual(Store(path).snapshot(),after);self.assertEqual(after['schema_version'],SCHEMA_VERSION)
 
     def test_print_invoice_and_blind_inventory(self):

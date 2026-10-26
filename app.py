@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import socket
 import threading
 import traceback
 import tempfile
@@ -440,6 +441,11 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     daemon_threads=True
+    def server_bind(self):
+        if os.name == "nt":
+            self.allow_reuse_address=False
+            self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
+        super().server_bind()
     def __init__(self,address,data,secure=False,public_url=''):
         self.public_url=public_url
         check_assets()
