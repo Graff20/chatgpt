@@ -44,16 +44,16 @@ jobs:
       - run: python scripts/ci_tests.py
       - run: python scripts/ci_step.py Server-build python -m PyInstaller --noconfirm --clean --onedir --additional-hooks-dir windows/hooks --name CehServer --add-data "static;static" app.py
       - run: python scripts/ci_step.py Admin-build python -m PyInstaller --noconfirm --clean --onedir --additional-hooks-dir windows/hooks --name CehAdmin manage.py
-      - run: python scripts/ci_step.py Frozen-smoke-test python scripts/smoke_frozen.py
       - name: Assemble server installer package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force bundle/dist/CehServer,bundle/windows,bundle/docs | Out-Null
+          New-Item -ItemType Directory -Force bundle/dist/CehServer/admin,bundle/windows,bundle/docs | Out-Null
           Copy-Item dist/CehServer/* bundle/dist/CehServer/ -Recurse -Force
-          Copy-Item dist/CehAdmin/* bundle/dist/CehServer/ -Recurse -Force
+          Copy-Item dist/CehAdmin/* bundle/dist/CehServer/admin/ -Recurse -Force
           Copy-Item windows/*.ps1 bundle/windows/
           Copy-Item windows/*.cmd bundle/windows/
           Copy-Item docs/SHARED-SERVER.md bundle/docs/
+      - run: python scripts/ci_step.py Frozen-smoke-test python scripts/smoke_frozen.py
       - uses: actions/upload-artifact@v4
         with:
           name: Ceh-Server-Windows

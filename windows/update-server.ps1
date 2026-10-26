@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Force "$backup\program" | Out-Null
 New-Item -ItemType File -Force "$DataDir\maintenance.flag" | Out-Null
 try {
  # SQLite backup API includes committed WAL pages while the service is still running.
- & "$InstallDir\CehAdmin.exe" backup --data $DataDir --output "$backup\ceh.sqlite3"
+ & "$InstallDir\admin\CehAdmin.exe" backup --data $DataDir --output "$backup\ceh.sqlite3"
  if ($LASTEXITCODE -ne 0) { throw 'Согласованная копия базы не создана' }
  Stop-ScheduledTask -TaskName 'CehServer'
  Start-Sleep -Seconds 2

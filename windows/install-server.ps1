@@ -20,8 +20,8 @@ if ($DatabaseCopy) {
  Copy-Item -LiteralPath $DatabaseCopy -Destination "$DataDir\ceh.sqlite3"
 }
 Copy-Item "$PSScriptRoot\..\dist\CehServer\*" $InstallDir -Recurse -Force
-if (!(Test-Path "$InstallDir\CehAdmin.exe")) { throw 'Нужен CehAdmin.exe из сборки Windows' }
-& "$InstallDir\CehAdmin.exe" init-admin --data $DataDir
+if (!(Test-Path "$InstallDir\admin\CehAdmin.exe")) { throw 'Нужен CehAdmin.exe из сборки Windows' }
+& "$InstallDir\admin\CehAdmin.exe" init-admin --data $DataDir
 if ($LASTEXITCODE -ne 0) { throw 'Создание администратора не завершено; автозапуск не установлен' }
 $arguments="--secure --host 127.0.0.1 --port 8765 --data `"$DataDir`" --log-file `"$DataDir\logs\server.log`""
 if ($PublicUrl) { $arguments += " --public-url `"$PublicUrl`"" }
