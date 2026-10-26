@@ -39,7 +39,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install pyinstaller==6.16.0
-      - run: python -m unittest discover -s tests -q
+      - run: python scripts/ci_tests.py
       - run: python -m PyInstaller --noconfirm --clean --onedir --name CehServer --add-data "static;static" app.py
       - run: python -m PyInstaller --noconfirm --clean --onedir --name CehAdmin manage.py
       - name: Assemble server installer package
